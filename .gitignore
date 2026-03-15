@@ -1,0 +1,16 @@
+# ROS2 build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.pyc
+
+# ardupilot_gazebo dış bağımlılık (ayrı repo'dan kurulur)
+ardupilot_gazebo/
+
+# IDE
+.vscode/
+.idea/
+
+# Log ve geçici dosyalar
+*.log
+*.bak

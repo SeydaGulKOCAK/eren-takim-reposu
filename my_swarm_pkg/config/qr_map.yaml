@@ -1,0 +1,220 @@
+# ============================================================
+# qr_map.yaml — TEKNOFEST 2026 Simülasyon QR Haritası
+# ============================================================
+# Pozisyonlar world_task1_qr_static.sdf ile eşleşir.
+# Şekil 2 JSON formatı: qr_perception.py bunu parse eder.
+#
+# YARI GÜNÜ: Bu dosyaya dokunma!
+#   mission_fsm dashboard'dan [m] → jüri koordinatlarını gir
+#   SetQRMap service runtime'da bu haritayı OVERRIDE eder.
+# ============================================================
+
+trigger_radius: 5.0     # [m] — drone bu mesafeye girince QR okunur
+
+# ----------------------------------------------------------
+# QR DÜĞÜMLER (6 adet — rota: 1 → 2 → 3 → 4 → 5 → 6 → HOME)
+# ----------------------------------------------------------
+qr_nodes:
+
+  1:
+    id: 1
+    position:
+      x: 10.0
+      y: 5.0
+      z: 0.0
+    content:
+      qr_id: 1
+      gorev:
+        formasyon:
+          aktif: true
+          tip: "OKBASI"
+        manevra_pitch_roll:
+          aktif: false
+          pitch_deg: "0"
+          roll_deg: "0"
+        irtifa_degisim:
+          aktif: true
+          deger: 15
+        bekleme_suresi_s: 3
+      suruden_ayrilma:
+        aktif: false
+        ayrilacak_drone_id: null
+        hedef_renk: null
+        bekleme_suresi_s: null
+      sonraki_qr:
+        team_1: 2
+        team_2: 2
+        team_3: 2
+
+  2:
+    id: 2
+    position:
+      x: 10.0
+      y: -5.0
+      z: 0.0
+    content:
+      qr_id: 2
+      gorev:
+        formasyon:
+          aktif: true
+          tip: "V"
+        manevra_pitch_roll:
+          aktif: false
+          pitch_deg: "0"
+          roll_deg: "0"
+        irtifa_degisim:
+          aktif: true
+          deger: 20
+        bekleme_suresi_s: 3
+      suruden_ayrilma:
+        aktif: false
+        ayrilacak_drone_id: null
+        hedef_renk: null
+        bekleme_suresi_s: null
+      sonraki_qr:
+        team_1: 3
+        team_2: 3
+        team_3: 3
+
+  3:
+    id: 3
+    position:
+      x: 15.0
+      y: 0.0
+      z: 0.0
+    content:
+      qr_id: 3
+      gorev:
+        formasyon:
+          aktif: true
+          tip: "CIZGI"
+        manevra_pitch_roll:
+          aktif: false
+          pitch_deg: "0"
+          roll_deg: "0"
+        irtifa_degisim:
+          aktif: false
+          deger: 20
+        bekleme_suresi_s: 4
+      suruden_ayrilma:
+        aktif: true
+        ayrilacak_drone_id: 2
+        hedef_renk: "RED"
+        bekleme_suresi_s: 10
+      sonraki_qr:
+        team_1: 4
+        team_2: 4
+        team_3: 4
+
+  4:
+    id: 4
+    position:
+      x: -5.0
+      y: 8.0
+      z: 0.0
+    content:
+      qr_id: 4
+      gorev:
+        formasyon:
+          aktif: true
+          tip: "OKBASI"
+        manevra_pitch_roll:
+          aktif: false
+          pitch_deg: "0"
+          roll_deg: "0"
+        irtifa_degisim:
+          aktif: true
+          deger: 15
+        bekleme_suresi_s: 3
+      suruden_ayrilma:
+        aktif: false
+        ayrilacak_drone_id: null
+        hedef_renk: null
+        bekleme_suresi_s: null
+      sonraki_qr:
+        team_1: 5
+        team_2: 5
+        team_3: 5
+
+  5:
+    id: 5
+    position:
+      x: -5.0
+      y: -8.0
+      z: 0.0
+    content:
+      qr_id: 5
+      gorev:
+        formasyon:
+          aktif: true
+          tip: "V"
+        manevra_pitch_roll:
+          aktif: true
+          pitch_deg: "10"
+          roll_deg: "0"
+        irtifa_degisim:
+          aktif: false
+          deger: 15
+        bekleme_suresi_s: 3
+      suruden_ayrilma:
+        aktif: false
+        ayrilacak_drone_id: null
+        hedef_renk: null
+        bekleme_suresi_s: null
+      sonraki_qr:
+        team_1: 6
+        team_2: 6
+        team_3: 6
+
+  6:
+    id: 6
+    position:
+      x: 20.0
+      y: 0.0
+      z: 0.0
+    content:
+      qr_id: 6
+      gorev:
+        formasyon:
+          aktif: true
+          tip: "CIZGI"
+        manevra_pitch_roll:
+          aktif: false
+          pitch_deg: "0"
+          roll_deg: "0"
+        irtifa_degisim:
+          aktif: true
+          deger: 10
+        bekleme_suresi_s: 3
+      suruden_ayrilma:
+        aktif: false
+        ayrilacak_drone_id: null
+        hedef_renk: null
+        bekleme_suresi_s: null
+      sonraki_qr:
+        team_1: 0
+        team_2: 0
+        team_3: 0
+
+# ----------------------------------------------------------
+# RENK ZONELARİ (precision_landing için)
+# Drone2 QR3'te ayrılacak → RED zone'a inecek
+# ----------------------------------------------------------
+color_zones:
+  - color: "RED"
+    x: 5.0
+    y: 3.0
+    z: 0.0
+    radius: 2.0
+
+  - color: "BLUE"
+    x: 5.0
+    y: -3.0
+    z: 0.0
+    radius: 2.0
+
+  - color: "GREEN"
+    x: -3.0
+    y: 0.0
+    z: 0.0
+    radius: 2.0
