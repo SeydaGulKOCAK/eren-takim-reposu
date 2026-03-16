@@ -305,11 +305,12 @@ class FormationController(Node):
         # 2) Formasyon komutu
         self.create_subscription(FormationCmd, '/swarm/formation_cmd', self._on_formation_cmd, 10)
 
-        # 3) Tüm drone state'leri
+        # 3) Tüm drone state'leri (BEST_EFFORT — local_fsm BEST_EFFORT yayınlar)
         for i in range(1, self.num_drones + 1):
             self.create_subscription(
                 LocalState, f'/drone{i}/local_state',
-                lambda msg, did=i: self._on_local_state(msg, did), 10
+                lambda msg, did=i: self._on_local_state(msg, did),
+                best_effort_qos
             )
 
         # 4) [YENİ] Tüm drone'ların GERÇEK POZİSYONU — centroid için!

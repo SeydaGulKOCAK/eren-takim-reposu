@@ -14,3 +14,14 @@ ardupilot_gazebo/
 # Log ve geçici dosyalar
 *.log
 *.bak
+
+# ROS2 build folders
+build/
+install/
+log/
+
+# simulation files
+*.tlog
+*.parm
+*.bin
+terrain/

@@ -19,8 +19,8 @@ qr_nodes:
   1:
     id: 1
     position:
-      x: 10.0
-      y: 5.0
+      x: 50.0
+      y: 0.0
       z: 0.0
     content:
       qr_id: 1
@@ -49,8 +49,8 @@ qr_nodes:
   2:
     id: 2
     position:
-      x: 10.0
-      y: -5.0
+      x: 42.5
+      y: 13.0
       z: 0.0
     content:
       qr_id: 2
@@ -79,8 +79,8 @@ qr_nodes:
   3:
     id: 3
     position:
-      x: 15.0
-      y: 0.0
+      x: 27.5
+      y: 13.0
       z: 0.0
     content:
       qr_id: 3
@@ -109,8 +109,8 @@ qr_nodes:
   4:
     id: 4
     position:
-      x: -5.0
-      y: 8.0
+      x: 20.0
+      y: 0.0
       z: 0.0
     content:
       qr_id: 4
@@ -139,8 +139,8 @@ qr_nodes:
   5:
     id: 5
     position:
-      x: -5.0
-      y: -8.0
+      x: 27.5
+      y: -13.0
       z: 0.0
     content:
       qr_id: 5
@@ -169,8 +169,8 @@ qr_nodes:
   6:
     id: 6
     position:
-      x: 20.0
-      y: 0.0
+      x: 42.5
+      y: -13.0
       z: 0.0
     content:
       qr_id: 6
@@ -202,19 +202,13 @@ qr_nodes:
 # ----------------------------------------------------------
 color_zones:
   - color: "RED"
-    x: 5.0
-    y: 3.0
+    x: 25.0
+    y: 8.0
     z: 0.0
     radius: 2.0
 
   - color: "BLUE"
-    x: 5.0
-    y: -3.0
-    z: 0.0
-    radius: 2.0
-
-  - color: "GREEN"
-    x: -3.0
-    y: 0.0
+    x: 25.0
+    y: -8.0
     z: 0.0
     radius: 2.0

@@ -421,8 +421,7 @@ class WaypointNavigatorNode(Node):
         # ── Centroid hesabı ───────────────────────────────────────────────────
         centroid = self._get_flying_centroid()
         if centroid is None:
-            # Konum verisi yok → loiter güvenli
-            self._publish_loiter(True)
+            # Konum verisi yok → bekle (loiter tetikleme, drone'lar henüz uçmuyor olabilir)
             return
 
         # ── Mesafe hesabı (XY düzlemi) ────────────────────────────────────────

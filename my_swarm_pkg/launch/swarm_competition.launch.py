@@ -71,11 +71,13 @@ def generate_launch_description():
     """
 
     # ── DRONE KONFİGÜRASYONU ──────────────────────────────────────────────
-    # (namespace, sysid, sitl_port, home_x, home_y, home_z)
+    # (namespace, sysid, mavros_udp_port, mp_udp_port, home_x, home_y, home_z)
+    # mavros_udp_port: MAVROS bağlantısı (udpclient → MAVROS dinliyor)
+    # mp_udp_port    : Mission Planner bağlantısı (udpclient → MP dinliyor)
     DRONE_CONFIGS = [
-        ('drone1', 1, 14550, 0.0,  0.0, 0.0),
-        ('drone2', 2, 14560, 4.0,  0.0, 0.0),
-        ('drone3', 3, 14570, 8.0,  0.0, 0.0),
+        ('drone1', 1, 14550, 14551, 0.0,  0.0, 0.0),
+        ('drone2', 2, 14560, 14561, 4.0,  0.0, 0.0),
+        ('drone3', 3, 14570, 14571, 8.0,  0.0, 0.0),
     ]
 
     # ── GEOFENCİNG PARAMETRE (Güvenlik) ───────────────────────────────────
@@ -94,19 +96,19 @@ def generate_launch_description():
     env = {
         'ROS_LOCALHOST_ONLY': '1',
         'CYCLONEDDS_URI': 'file://' + os.path.expanduser(
-            '~/gz_ws/src/my_swarm_pkg/config/cyclonedds_localhost.xml'
+            '~/eren-takim-reposu/my_swarm_pkg/config/cyclonedds_localhost.xml'
         ),
         'GZ_SIM_RESOURCE_PATH': ':'.join([
-            os.path.expanduser('~/gz_ws/src/my_swarm_pkg/models'),
-            os.path.expanduser('~/gz_ws/src/ardupilot_gazebo/models'),
-            os.path.expanduser('~/gz_ws/install/ardupilot_gazebo/share/ardupilot_gazebo/models'),
+            os.path.expanduser('~/eren-takim-reposu/my_swarm_pkg/models'),
+            os.path.expanduser('~/new_repo_local/gz_ws/src/ardupilot_gazebo/models'),
             os.path.expanduser('~/ardupilot_gazebo/models'),
             '/usr/share/gz/gz-sim8/models',
         ]),
+        'GZ_SIM_SYSTEM_PLUGIN_PATH': os.path.expanduser('~/ardupilot_gazebo/build'),
     }
 
-    ws = os.path.expanduser('~/gz_ws')
-    pkg_dir = os.path.join(ws, 'src/my_swarm_pkg')
+    ws = os.path.expanduser('~/eren-takim-reposu')
+    pkg_dir = os.path.join(ws, 'my_swarm_pkg')
 
     args = []
 
@@ -163,11 +165,11 @@ def generate_launch_description():
     # ═══════════════════════════════════════════════════════════════════════
     sitl_procs = []
 
-    for ns, sysid, port, hx, hy, hz in DRONE_CONFIGS:
+    for ns, sysid, mavros_port, mp_port, hx, hy, hz in DRONE_CONFIGS:
         idx = sysid - 1  # -I parameter için (0, 1, 2)
-        
+
         args.append(
-            LogInfo(msg=f'🛩️  SITL drone{sysid} (port {port}) başlatılıyor...')
+            LogInfo(msg=f'🛩️  SITL drone{sysid} (MAVROS UDP:{mavros_port} / MP UDP:{mp_port}) başlatılıyor...')
         )
 
         # Timer: SITL'ler sırayla başlasın (boğulma önleme)
@@ -188,6 +190,10 @@ def generate_launch_description():
                                 '~/ardupilot/Tools/autotest/default_params/copter.parm'),
                             '--sim-address=127.0.0.1',
                             '--home', f'-35.363262,149.165237,584.0,0.0',
+                            # SERIAL0 → MAVROS UDP
+                            '--serial0', f'udpclient:127.0.0.1:{mavros_port}',
+                            # SERIAL1 → Mission Planner UDP
+                            '--serial1', f'udpclient:127.0.0.1:{mp_port}',
                         ],
                         cwd=os.path.expanduser('~/ardupilot'),
                         output='log',
@@ -209,9 +215,9 @@ def generate_launch_description():
     # ═══════════════════════════════════════════════════════════════════════
     mavros_nodes = []
 
-    for ns, sysid, port, hx, hy, hz in DRONE_CONFIGS:
+    for ns, sysid, mavros_port, mp_port, hx, hy, hz in DRONE_CONFIGS:
         args.append(
-            LogInfo(msg=f'🔌 MAVROS {ns} (sysid={sysid}) kurulacak...')
+            LogInfo(msg=f'🔌 MAVROS {ns} (sysid={sysid}, UDP:{mavros_port}) kurulacak...')
         )
 
         mavros_nodes.append(
@@ -221,9 +227,11 @@ def generate_launch_description():
                     Node(
                         package='mavros',
                         executable='mavros_node',
-                        namespace=ns,
+                        namespace=f'{ns}/mavros',
                         parameters=[{
-                            'fcu_url': f'udp://:{port}@',
+                            # SITL udpclient olarak 14550'e gönderiyor
+                            # MAVROS o porta dinliyor: udp://:14550@
+                            'fcu_url': f'udp://:{mavros_port}@',
                             'tgt_system': sysid,
                         }],
                         output='log',
@@ -240,7 +248,7 @@ def generate_launch_description():
     # ═══════════════════════════════════════════════════════════════════════
     per_drone_nodes = []
 
-    for ns, sysid, port, hx, hy, hz in DRONE_CONFIGS:
+    for ns, sysid, mavros_port, mp_port, hx, hy, hz in DRONE_CONFIGS:
         delay = 9.0 + (sysid - 1) * 0.5
         
         env_vars = {
@@ -448,6 +456,34 @@ def generate_launch_description():
         )
     )
 
+    # ── color_zone_detector — kamera ile HSV renk zonu tespiti ───────────
+    # Drone2 + Drone3 kamerasını dinler, /perception/color_zones yayınlar.
+    # qr_perception.py'deki YAML tabanlı sabit koordinatların yerini alır.
+    color_zone_env = dict(env)
+    per_drone_nodes.append(
+        TimerAction(
+            period=11.0,
+            actions=[
+                Node(
+                    package='my_swarm_pkg',
+                    executable='color_zone_detector',
+                    parameters=[{
+                        'camera_drone_id': 3,
+                        'backup_drone_id': 2,
+                        'publish_hz': 5.0,
+                        'min_area_px': 500,
+                        'camera_fov_h_deg': 60.0,
+                        'img_width': 640,
+                        'img_height': 480,
+                        'zone_radius': 2.0,
+                    }],
+                    output='log',
+                    additional_env=color_zone_env,
+                )
+            ]
+        )
+    )
+
     args.extend(per_drone_nodes)
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -470,6 +506,8 @@ def generate_launch_description():
                         '-title', 'Mission FSM Dashboard',
                         '-e', 'bash', '-c',
                         f'source {ws}/install/setup.bash && '
+                        f'export GZ_SIM_RESOURCE_PATH={env["GZ_SIM_RESOURCE_PATH"]} && '
+                        f'export GZ_SIM_SYSTEM_PLUGIN_PATH={env["GZ_SIM_SYSTEM_PLUGIN_PATH"]} && '
                         f'export ROS_LOCALHOST_ONLY=1 && '
                         f'export CYCLONEDDS_URI={env["CYCLONEDDS_URI"]} && '
                         f'ros2 run my_swarm_pkg mission_fsm'

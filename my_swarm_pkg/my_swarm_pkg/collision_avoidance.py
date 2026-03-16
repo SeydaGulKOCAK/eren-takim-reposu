@@ -275,7 +275,7 @@ class CollisionAvoidanceNode(Node):
                 LocalState,
                 f'/drone{i}/local_state',
                 lambda msg, uid=i: self._on_neighbor_state(msg, uid),
-                reliable_qos,
+                best_effort_qos,  # local_fsm BEST_EFFORT yayınlar
             )
 
         # 4) Sürü niyeti (detach_drone_id için)
