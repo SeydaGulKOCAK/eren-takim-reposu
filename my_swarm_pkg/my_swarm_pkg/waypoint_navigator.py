@@ -246,7 +246,7 @@ class WaypointNavigatorNode(Node):
                 LocalState,
                 f'/drone{i}/local_state',
                 lambda msg, uid=i: self._on_neighbor_state(msg, uid),
-                reliable_qos,
+                best_effort_qos,
             )
 
         # ── Yayıncılar ────────────────────────────────────────────────────────

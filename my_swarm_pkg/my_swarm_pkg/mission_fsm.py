@@ -234,7 +234,7 @@ class MissionFSMNode(Node):
                 LocalState,
                 f'/drone{i}/local_state',
                 lambda msg, uid=i: self._on_drone_state(msg, uid),
-                reliable_qos,
+                best_effort_qos,
             )
 
         # Sürü niyeti (görev ilerlemesi için)
