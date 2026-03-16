@@ -96,19 +96,20 @@ def generate_launch_description():
     env = {
         'ROS_LOCALHOST_ONLY': '1',
         'CYCLONEDDS_URI': 'file://' + os.path.expanduser(
-            '~/eren-takim-reposu/my_swarm_pkg/config/cyclonedds_localhost.xml'
+            '~/gz_ws/src/my_swarm_pkg/config/cyclonedds_localhost.xml'
         ),
         'GZ_SIM_RESOURCE_PATH': ':'.join([
-            os.path.expanduser('~/eren-takim-reposu/my_swarm_pkg/models'),
-            os.path.expanduser('~/new_repo_local/gz_ws/src/ardupilot_gazebo/models'),
+            os.path.expanduser('~/gz_ws/src/my_swarm_pkg/models'),
+            os.path.expanduser('~/gz_ws/src/ardupilot_gazebo/models'),
+            os.path.expanduser('~/gz_ws/install/ardupilot_gazebo/share/ardupilot_gazebo/models'),
             os.path.expanduser('~/ardupilot_gazebo/models'),
             '/usr/share/gz/gz-sim8/models',
         ]),
         'GZ_SIM_SYSTEM_PLUGIN_PATH': os.path.expanduser('~/ardupilot_gazebo/build'),
     }
 
-    ws = os.path.expanduser('~/eren-takim-reposu')
-    pkg_dir = os.path.join(ws, 'my_swarm_pkg')
+    ws = os.path.expanduser('~/gz_ws')
+    pkg_dir = os.path.join(ws, 'src/my_swarm_pkg')
 
     args = []
 
@@ -227,7 +228,7 @@ def generate_launch_description():
                     Node(
                         package='mavros',
                         executable='mavros_node',
-                        namespace=f'{ns}/mavros',
+                        namespace=ns,
                         parameters=[{
                             # SITL udpclient olarak 14550'e gönderiyor
                             # MAVROS o porta dinliyor: udp://:14550@
