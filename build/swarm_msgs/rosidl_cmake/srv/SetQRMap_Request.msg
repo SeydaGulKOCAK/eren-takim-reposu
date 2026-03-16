@@ -1,3 +1,0 @@
-geometry_msgs/Point[] qr_positions
-uint32[] qr_ids
-uint32[] next_qr_ids
