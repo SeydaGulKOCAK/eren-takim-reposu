@@ -45,7 +45,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
 from geometry_msgs.msg import PoseStamped, TwistStamped
 from mavros_msgs.msg import State
-from mavros_msgs.srv import CommandBool, SetMode
+from mavros_msgs.srv import CommandBool, SetMode, CommandLong, CommandTOL
 from std_msgs.msg import Bool, String
 
 
@@ -64,7 +64,9 @@ class DroneInterface(Node):
         # launch dosyasından veya -p drone_id:=2 ile verilir
         # ══════════════════════════════════════════════════════
         self.declare_parameter('drone_id', 1)
+        self.declare_parameter('takeoff_altitude', 10.0)
         self.drone_id = self.get_parameter('drone_id').value
+        self.takeoff_altitude = self.get_parameter('takeoff_altitude').value
 
         # Topic prefix oluştur: drone_id=2 → ns='drone2'
         self.ns = f'drone{self.drone_id}'
@@ -83,6 +85,7 @@ class DroneInterface(Node):
         self.current_state = State()   # MAVROS'tan gelen son durum
         self.last_mode = ''            # Son gönderilen mod (tekrar engeli)
         self.pilot_override_active = False  # RC kill-switch aktif mi?
+        self._arm_pending = False      # ARM komutu GUIDED onayı bekliyor
         # State-triggered yayın için: son yayınlanan değeri sakla.
         # Böylece sadece değişince yayınlarız, gereksiz Wi-Fi trafiği önlenir.
         self._last_published_override = None
@@ -235,6 +238,15 @@ class DroneInterface(Node):
         self.arming_client = self.create_client(
             CommandBool, f'{self.mavros_ns}/cmd/arming'
         )
+        # Force ARM için MAVLink komut servisi (pre-arm check'leri atlayarak)
+        self.cmd_client = self.create_client(
+            CommandLong, f'{self.mavros_ns}/cmd/command'
+        )
+
+        # Kalkış komutu (ARM sonrası çağrılır)
+        self.takeoff_client = self.create_client(
+            CommandTOL, f'{self.mavros_ns}/cmd/takeoff'
+        )
 
         # ══════════════════════════════════════════════════════
         # PERİYODİK GÖREV (Timer) - HEARTBEAT
@@ -279,13 +291,13 @@ class DroneInterface(Node):
         → intent_coordinator bu drone'u FLYING listesinden çıkarır
         → "Drone düştü!" yanlış alarmı engellenir (Şartname §5.5.4)
         """
-        prev_mode = self.current_state.custom_mode
+        prev_mode = self.current_state.mode
         self.current_state = msg
 
         # Mod değiştiyse logla
-        if prev_mode != msg.custom_mode:
+        if prev_mode != msg.mode:
             self.get_logger().info(
-                f'🔄 [{self.ns}] Mod: {prev_mode or "?"} → {msg.custom_mode}'
+                f'🔄 [{self.ns}] Mod: {prev_mode or "?"} → {msg.mode}'
             )
 
         # Otonom sistem tarafından kullanılan izinli modlar (whitelist).
@@ -296,10 +308,10 @@ class DroneInterface(Node):
         AUTONOMOUS_MODES = ('GUIDED', 'LAND', 'RTL', 'BRAKE', 'AUTO')
 
         # ARM'lıyken whitelist dışı mod → GERÇEK PILOT MÜDAHALESİ!
-        if msg.armed and msg.custom_mode not in AUTONOMOUS_MODES:
+        if msg.armed and msg.mode not in AUTONOMOUS_MODES:
             if not self.pilot_override_active:
                 self.get_logger().warn(
-                    f'⚠️  [{self.ns}] PILOT OVERRIDE! Mod: {msg.custom_mode}'
+                    f'⚠️  [{self.ns}] PILOT OVERRIDE! Mod: {msg.mode}'
                 )
                 self.pilot_override_active = True
                 # Değişti → ANINDA yayınla (state-triggered)
@@ -312,6 +324,14 @@ class DroneInterface(Node):
                 self.pilot_override_active = False
                 # Değişti → ANINDA yayınla (state-triggered)
                 self._publish_pilot_override_state()
+
+        # GUIDED onaylandıysa bekleyen ARM varsa şimdi gönder
+        if msg.mode == 'GUIDED' and self._arm_pending and not msg.armed:
+            self._arm_pending = False
+            self.get_logger().info(
+                f'✅ [{self.ns}] GUIDED onaylandı → ARM gönderiliyor'
+            )
+            self.arm(value=True)
 
     # ══════════════════════════════════════════════════════════════════════
     # SİSTEM → MAVROS CALLBACK'LERİ
@@ -401,7 +421,19 @@ class DroneInterface(Node):
           FLYING → DISARM_WAIT  : ARM=False (iniş sonrası)
           REARM state           : ARM=True  (sürüye yeniden katılım)
         """
-        self.arm(value=msg.data)
+        if not msg.data:
+            self.arm(value=False)
+            return
+
+        # ARM=True: GUIDED mod onaylanana kadar bekle
+        # (STABILIZE'da ARM → PILOT_OVERRIDE tetikler)
+        if self.current_state.mode == 'GUIDED':
+            self.arm(value=True)
+        else:
+            self._arm_pending = True
+            self.get_logger().info(
+                f'⏳ [{self.ns}] ARM bekleniyor: mod={self.current_state.mode or "?"} → GUIDED onayı bekleniyor'
+            )
 
     def _landing_target_cb(self, msg: PoseStamped):
         """
@@ -477,11 +509,13 @@ class DroneInterface(Node):
                         self.get_logger().info(
                             f'✅ [{self.ns}] {action} başarılı!'
                         )
+                        if value:
+                            self.takeoff()
                     else:
-                        self.get_logger().error(
-                            f'❌ [{self.ns}] Pixhawk {action} reddetti! '
-                            f'Kalibrasyon/güvenlik kontrolü gerekli olabilir.'
+                        self.get_logger().warn(
+                            f'⚠️  [{self.ns}] Normal ARM reddedildi, force ARM deneniyor...'
                         )
+                        self._force_arm(value)
                 except Exception as e:
                     self.get_logger().error(
                         f'❌ [{self.ns}] arming servis hatası: {e}'
@@ -490,6 +524,75 @@ class DroneInterface(Node):
             future.add_done_callback(_on_arm_done)
         else:
             self.get_logger().warn(f'⚠️  [{self.ns}] arming servisi hazır değil!')
+
+    def _force_arm(self, value: bool = True):
+        """Pre-arm check'leri atlayarak force ARM (SITL simülasyon için)."""
+        if not self.cmd_client.service_is_ready():
+            return
+        req = CommandLong.Request()
+        req.command = 400  # MAV_CMD_COMPONENT_ARM_DISARM
+        req.param1 = 1.0 if value else 0.0
+        req.param2 = 21196.0  # ArduPilot force flag
+        future = self.cmd_client.call_async(req)
+
+        def _on_force_arm_done(f):
+            try:
+                r = f.result()
+                if r.success:
+                    self.get_logger().info(f'✅ [{self.ns}] Force ARM başarılı!')
+                    if value:
+                        self.takeoff()
+                else:
+                    self.get_logger().error(f'❌ [{self.ns}] Force ARM da başarısız!')
+            except Exception as e:
+                self.get_logger().error(f'❌ [{self.ns}] Force ARM hatası: {e}')
+
+        future.add_done_callback(_on_force_arm_done)
+
+    def takeoff(self):
+        """
+        ARM sonrası kalkış komutu gönder (MAV_CMD_NAV_TAKEOFF).
+        ArduCopter ARM'dan sonra ~2 saniye içinde takeoff almazsa auto-disarm yapar.
+        Bu metod ARM callback'inden hemen çağrılır.
+        """
+        if not self.takeoff_client.service_is_ready():
+            self.get_logger().warn(
+                f'⚠️  [{self.ns}] takeoff servisi hazır değil, 1sn sonra tekrar denenecek'
+            )
+            self.create_timer(1.0, lambda: self.takeoff())
+            return
+
+        req = CommandTOL.Request()
+        req.min_pitch = 0.0
+        req.yaw = 0.0
+        req.latitude = 0.0   # 0 = mevcut konumu kullan
+        req.longitude = 0.0
+        req.altitude = self.takeoff_altitude
+
+        self.get_logger().info(
+            f'🚀 [{self.ns}] KALKIŞ komutu: {self.takeoff_altitude}m'
+        )
+        future = self.takeoff_client.call_async(req)
+
+        def _on_takeoff_done(f):
+            try:
+                r = f.result()
+                if r.success:
+                    self.get_logger().info(
+                        f'✅ [{self.ns}] Kalkış komutu kabul edildi! '
+                        f'Hedef: {self.takeoff_altitude}m'
+                    )
+                else:
+                    self.get_logger().error(
+                        f'❌ [{self.ns}] Kalkış komutu reddedildi! '
+                        f'(result={r.result})'
+                    )
+            except Exception as e:
+                self.get_logger().error(
+                    f'❌ [{self.ns}] takeoff servis hatası: {e}'
+                )
+
+        future.add_done_callback(_on_takeoff_done)
 
 
 # ══════════════════════════════════════════════════════════════════════════

@@ -72,6 +72,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.clock import Clock
 from rclpy.time import Time
+from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy, QoSHistoryPolicy
 
 from std_msgs.msg import String, Bool
 from geometry_msgs.msg import PoseStamped
@@ -199,8 +200,15 @@ class LocalFSM(Node):
         # ══════════════════════════════════════════════════════
 
         # 1) State yayınla → intent_coordinator ve swarm_comm okur
+        # VOLATILE: eski mesajlar yeni subscriber'lara iletilmesin (zombie state sorunu)
+        volatile_qos = QoSProfile(
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            durability=QoSDurabilityPolicy.VOLATILE,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=5,
+        )
         self.local_state_pub = self.create_publisher(
-            LocalState, f'/{self.ns}/local_state', 10
+            LocalState, f'/{self.ns}/local_state', volatile_qos
         )
 
         # 2) Mod komutu → drone_interface okur → Pixhawk'a iletir
@@ -464,10 +472,10 @@ class LocalFSM(Node):
                 f'🚀 [{self.ns}] IDLE intent alındı, STANDBY → IDLE geçişi'
             )
             self._transition_to(State.IDLE)
+            # GUIDED moda al (ARM öncesi! STABILIZE'da arm → PILOT_OVERRIDE tetikler)
+            self._send_mode('GUIDED')
             # Drone'u ARM et (motorlar hazır)
             self._send_arm(True)
-            # GUIDED moda al (otonom uçuşa hazır)
-            self._send_mode('GUIDED')
 
     def _handle_navigate_intent(self, msg: SwarmIntent):
         """

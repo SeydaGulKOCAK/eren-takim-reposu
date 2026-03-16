@@ -1,0 +1,16 @@
+{
+  "package_name": "swarm_msgs",
+  "non_idl_tuples": [
+    "/home/beyza/eren-takim-reposu/swarm_msgs:msg/LocalState.msg",
+    "/home/beyza/eren-takim-reposu/swarm_msgs:msg/SwarmIntent.msg",
+    "/home/beyza/eren-takim-reposu/swarm_msgs:msg/JoinRequest.msg",
+    "/home/beyza/eren-takim-reposu/swarm_msgs:msg/SafetyEvent.msg",
+    "/home/beyza/eren-takim-reposu/swarm_msgs:msg/FormationCmd.msg",
+    "/home/beyza/eren-takim-reposu/swarm_msgs:msg/QRResult.msg",
+    "/home/beyza/eren-takim-reposu/swarm_msgs:msg/TaskTrigger.msg",
+    "/home/beyza/eren-takim-reposu/swarm_msgs:msg/TeleopCmd.msg",
+    "/home/beyza/eren-takim-reposu/swarm_msgs:msg/ColorZone.msg",
+    "/home/beyza/eren-takim-reposu/swarm_msgs:msg/ColorZoneList.msg",
+    "/home/beyza/eren-takim-reposu/swarm_msgs:srv/SetQRMap.srv"
+  ]
+}

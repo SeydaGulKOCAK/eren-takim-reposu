@@ -1,0 +1,111 @@
+// generated from rosidl_adapter/resource/msg.idl.em
+// with input from swarm_msgs/msg/SwarmIntent.msg
+// generated code does not contain a copyright notice
+
+#include "builtin_interfaces/msg/Time.idl"
+#include "geometry_msgs/msg/Point.idl"
+#include "std_msgs/msg/Header.idl"
+
+module swarm_msgs {
+  module msg {
+    @verbatim (language="comment", text=
+      "SwarmIntent.msg" "\n"
+      "Yayıncı : intent_coordinator (SADECE LİDER İHA)" "\n"
+      "Okuyan  : local_fsm (TÜM İHA'lar), formation_controller (TÜM)" "\n"
+      "" "\n"
+      "Tüm sürünün ne yapacağını söyleyen ANA KOMUT paketidir." "\n"
+      "Bu mesajı SADECE lider İHA'daki intent_coordinator yazar." "\n"
+      "GCS ASLA bu topic'e yazmaz → §5.3 dağıtık mimari kuralı." "\n"
+      "" "\n"
+      "ÇİFT FİLTRE KURALI (local_fsm'de uygulanır):" "\n"
+      "  1) seq < son_seq → ESKİ LİDERDEN KALAN MESAJ → DROP et" "\n"
+      "  2) seq == son_seq ve header.stamp < son_timestamp → DROP et")
+    struct SwarmIntent {
+      @verbatim (language="comment", text=
+        "timestamp (çift filtre için kullanılır)")
+      std_msgs::msg::Header header;
+
+      @verbatim (language="comment", text=
+        "Monotonic artan sıra no (lider değişiminde seq+1'den devam)")
+      uint32 seq;
+
+      @verbatim (language="comment", text=
+        "Bu mesajı kim üretiyor? (lider drone'un ID'si)")
+      uint8 leader_id;
+
+      @verbatim (language="comment", text=
+        "── GÖREV BİLGİSİ ──────────────────────────────────────────────" "\n"
+        "Aktif görev: 'QR_NAVIGATE' / 'DETACH' / 'REJOIN' /" "\n"
+        "'RETURN_HOME' / 'IDLE' / 'MANEUVER'")
+      string task_id;
+
+      @verbatim (language="comment", text=
+        "── FORMASYON ──────────────────────────────────────────────────" "\n"
+        "'OKBASI' / 'V' / 'CIZGI'")
+      string formation_type;
+
+      @verbatim (language="comment", text=
+        "Drone'lar arası mesafe (metre) — QR'dan gelir")
+      float drone_spacing;
+
+      @verbatim (language="comment", text=
+        "Sürünün ilerleyeceği yön (radyan, ENU'da kuzeyden)" "\n"
+        "formation_controller offset rotasyonu için kullanır")
+      float target_yaw;
+
+      @verbatim (language="comment", text=
+        "── HEDEF POZİSYON ─────────────────────────────────────────────" "\n"
+        "Sonraki QR / hedef koordinat (ENU, metre)")
+      geometry_msgs::msg::Point target_pos;
+
+      @verbatim (language="comment", text=
+        "Hedef irtifa (metre) — QR'dan gelir")
+      float drone_altitude;
+
+      @verbatim (language="comment", text=
+        "── BİREY ÇIKARMA / EKLEME ──────────────────────────────────────" "\n"
+        "Ayrılacak drone'un ID'si (0 = kimse ayrılmıyor)")
+      uint8 detach_drone_id;
+
+      @verbatim (language="comment", text=
+        "İniş yapılacak zone rengi: 'RED' / 'BLUE' / ''")
+      string zone_color;
+
+      @verbatim (language="comment", text=
+        "── MANEVRA ────────────────────────────────────────────────────" "\n"
+        "Pitch/Roll manevrası aktif mi?")
+      boolean maneuver_active;
+
+      @verbatim (language="comment", text=
+        "Pitch açısı (derece) — negatif = öne eğim")
+      float maneuver_pitch_deg;
+
+      @verbatim (language="comment", text=
+        "Roll açısı (derece) — sağa pozitif")
+      float maneuver_roll_deg;
+
+      @verbatim (language="comment", text=
+        "── SÜRÜ DURUMU ────────────────────────────────────────────────" "\n"
+        "Şu an FLYING olan drone sayısı" "\n"
+        "formation_controller fallback için kullanır:" "\n"
+        "< 3 → 2'li LINE formasyonuna geç")
+      uint8 active_drone_count;
+
+      @verbatim (language="comment", text=
+        "Sürüye katılacak yedek drone'un ID'si (0 = yok)")
+      uint8 join_drone_id;
+
+      @verbatim (language="comment", text=
+        "── QR BİLGİSİ ─────────────────────────────────────────────────" "\n"
+        "QR sıra numarası (her QR için artar)" "\n"
+        "Aynı QR'ı iki kez işlemeyi engeller")
+      uint32 qr_seq;
+
+      @verbatim (language="comment", text=
+        "── BEKLEME ────────────────────────────────────────────────────" "\n"
+        "Bu zamana kadar mevcut konumda bekle" "\n"
+        "Manevra / QR okuma sırasında kullanılır")
+      builtin_interfaces::msg::Time wait_until;
+    };
+  };
+};

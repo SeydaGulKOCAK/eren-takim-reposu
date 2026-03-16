@@ -1,0 +1,42 @@
+file(REMOVE_RECURSE
+  "CMakeFiles/swarm_msgs__rosidl_typesupport_c.dir/rosidl_typesupport_c/swarm_msgs/msg/color_zone__type_support.cpp.o"
+  "CMakeFiles/swarm_msgs__rosidl_typesupport_c.dir/rosidl_typesupport_c/swarm_msgs/msg/color_zone__type_support.cpp.o.d"
+  "CMakeFiles/swarm_msgs__rosidl_typesupport_c.dir/rosidl_typesupport_c/swarm_msgs/msg/color_zone_list__type_support.cpp.o"
+  "CMakeFiles/swarm_msgs__rosidl_typesupport_c.dir/rosidl_typesupport_c/swarm_msgs/msg/color_zone_list__type_support.cpp.o.d"
+  "CMakeFiles/swarm_msgs__rosidl_typesupport_c.dir/rosidl_typesupport_c/swarm_msgs/msg/formation_cmd__type_support.cpp.o"
+  "CMakeFiles/swarm_msgs__rosidl_typesupport_c.dir/rosidl_typesupport_c/swarm_msgs/msg/formation_cmd__type_support.cpp.o.d"
+  "CMakeFiles/swarm_msgs__rosidl_typesupport_c.dir/rosidl_typesupport_c/swarm_msgs/msg/join_request__type_support.cpp.o"
+  "CMakeFiles/swarm_msgs__rosidl_typesupport_c.dir/rosidl_typesupport_c/swarm_msgs/msg/join_request__type_support.cpp.o.d"
+  "CMakeFiles/swarm_msgs__rosidl_typesupport_c.dir/rosidl_typesupport_c/swarm_msgs/msg/local_state__type_support.cpp.o"
+  "CMakeFiles/swarm_msgs__rosidl_typesupport_c.dir/rosidl_typesupport_c/swarm_msgs/msg/local_state__type_support.cpp.o.d"
+  "CMakeFiles/swarm_msgs__rosidl_typesupport_c.dir/rosidl_typesupport_c/swarm_msgs/msg/qr_result__type_support.cpp.o"
+  "CMakeFiles/swarm_msgs__rosidl_typesupport_c.dir/rosidl_typesupport_c/swarm_msgs/msg/qr_result__type_support.cpp.o.d"
+  "CMakeFiles/swarm_msgs__rosidl_typesupport_c.dir/rosidl_typesupport_c/swarm_msgs/msg/safety_event__type_support.cpp.o"
+  "CMakeFiles/swarm_msgs__rosidl_typesupport_c.dir/rosidl_typesupport_c/swarm_msgs/msg/safety_event__type_support.cpp.o.d"
+  "CMakeFiles/swarm_msgs__rosidl_typesupport_c.dir/rosidl_typesupport_c/swarm_msgs/msg/swarm_intent__type_support.cpp.o"
+  "CMakeFiles/swarm_msgs__rosidl_typesupport_c.dir/rosidl_typesupport_c/swarm_msgs/msg/swarm_intent__type_support.cpp.o.d"
+  "CMakeFiles/swarm_msgs__rosidl_typesupport_c.dir/rosidl_typesupport_c/swarm_msgs/msg/task_trigger__type_support.cpp.o"
+  "CMakeFiles/swarm_msgs__rosidl_typesupport_c.dir/rosidl_typesupport_c/swarm_msgs/msg/task_trigger__type_support.cpp.o.d"
+  "CMakeFiles/swarm_msgs__rosidl_typesupport_c.dir/rosidl_typesupport_c/swarm_msgs/msg/teleop_cmd__type_support.cpp.o"
+  "CMakeFiles/swarm_msgs__rosidl_typesupport_c.dir/rosidl_typesupport_c/swarm_msgs/msg/teleop_cmd__type_support.cpp.o.d"
+  "CMakeFiles/swarm_msgs__rosidl_typesupport_c.dir/rosidl_typesupport_c/swarm_msgs/srv/set_qr_map__type_support.cpp.o"
+  "CMakeFiles/swarm_msgs__rosidl_typesupport_c.dir/rosidl_typesupport_c/swarm_msgs/srv/set_qr_map__type_support.cpp.o.d"
+  "libswarm_msgs__rosidl_typesupport_c.pdb"
+  "libswarm_msgs__rosidl_typesupport_c.so"
+  "rosidl_typesupport_c/swarm_msgs/msg/color_zone__type_support.cpp"
+  "rosidl_typesupport_c/swarm_msgs/msg/color_zone_list__type_support.cpp"
+  "rosidl_typesupport_c/swarm_msgs/msg/formation_cmd__type_support.cpp"
+  "rosidl_typesupport_c/swarm_msgs/msg/join_request__type_support.cpp"
+  "rosidl_typesupport_c/swarm_msgs/msg/local_state__type_support.cpp"
+  "rosidl_typesupport_c/swarm_msgs/msg/qr_result__type_support.cpp"
+  "rosidl_typesupport_c/swarm_msgs/msg/safety_event__type_support.cpp"
+  "rosidl_typesupport_c/swarm_msgs/msg/swarm_intent__type_support.cpp"
+  "rosidl_typesupport_c/swarm_msgs/msg/task_trigger__type_support.cpp"
+  "rosidl_typesupport_c/swarm_msgs/msg/teleop_cmd__type_support.cpp"
+  "rosidl_typesupport_c/swarm_msgs/srv/set_qr_map__type_support.cpp"
+)
+
+# Per-language clean rules from dependency scanning.
+foreach(lang CXX)
+  include(CMakeFiles/swarm_msgs__rosidl_typesupport_c.dir/cmake_clean_${lang}.cmake OPTIONAL)
+endforeach()

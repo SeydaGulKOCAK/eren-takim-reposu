@@ -66,6 +66,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 
 from geometry_msgs.msg import PoseStamped
+from sensor_msgs.msg import Image as RosImage
 from swarm_msgs.msg import LocalState, QRResult, ColorZone, ColorZoneList
 from std_msgs.msg import Bool
 from swarm_msgs.srv import SetQRMap
@@ -75,6 +76,24 @@ try:
     _AMENT_AVAILABLE = True
 except ImportError:
     _AMENT_AVAILABLE = False
+
+try:
+    import cv2
+    _CV2_AVAILABLE = True
+except ImportError:
+    _CV2_AVAILABLE = False
+
+try:
+    from cv_bridge import CvBridge
+    _CVBRIDGE_AVAILABLE = True
+except ImportError:
+    _CVBRIDGE_AVAILABLE = False
+
+try:
+    import pyzbar.pyzbar as pyzbar
+    _PYZBAR_AVAILABLE = True
+except ImportError:
+    _PYZBAR_AVAILABLE = False
 
 # Kamera failover'ı tetikleyen yerel durumlar
 _FAILOVER_STATES = frozenset({'DETACH', 'SAFETY_HOLD', 'PILOT_OVERRIDE'})
@@ -94,6 +113,7 @@ class QRPerception(Node):
         self.declare_parameter('num_drones',             3)
         self.declare_parameter('trigger_radius',         5.0)
         self.declare_parameter('qr_map_file',            '')
+        self.declare_parameter('use_camera',             True)
 
         self._team_id        = self.get_parameter('team_id').value
         self._primary_cam_id = self.get_parameter('camera_drone_id').value
@@ -101,6 +121,7 @@ class QRPerception(Node):
         self._num_drones     = self.get_parameter('num_drones').value
         self._trigger_radius = self.get_parameter('trigger_radius').value
         qr_map_file          = self.get_parameter('qr_map_file').value
+        self._use_camera     = self.get_parameter('use_camera').value
 
         # 'team1' → 'team_1' (YAML anahtar uyumu)
         self._team_key = self._team_id.replace('team', 'team_')
@@ -131,6 +152,9 @@ class QRPerception(Node):
         }
         self._read_qr_ids: set[int] = set()   # aynı QR iki kez okunmaz
 
+        # ── cv_bridge ────────────────────────────────────────────────────
+        self._bridge = CvBridge() if _CVBRIDGE_AVAILABLE else None
+
         # ── QoS ─────────────────────────────────────────────────────────
         be_qos = QoSProfile(
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
@@ -150,10 +174,34 @@ class QRPerception(Node):
                 lambda msg, did=i: self._on_pose(msg, did), be_qos)
             self.create_subscription(
                 LocalState, f'/drone{i}/local_state',
-                lambda msg, did=i: self._on_local_state(msg, did), 10)
+                lambda msg, did=i: self._on_local_state(msg, did), be_qos)
+
+        # ── KAMERA ABONELİKLERİ (pyzbar görsel QR okuma) ─────────────
+        _cam_ok = _CV2_AVAILABLE and _CVBRIDGE_AVAILABLE and _PYZBAR_AVAILABLE
+        if self._use_camera and _cam_ok:
+            for cam_id in set([self._primary_cam_id, self._backup_cam_id]):
+                self.create_subscription(
+                    RosImage,
+                    f'/drone{cam_id}/camera/image_raw',
+                    lambda msg, did=cam_id: self._on_camera_image(msg, did),
+                    be_qos,
+                )
+            self.get_logger().info(
+                f'   Kamera QR modu: AKTIF (pyzbar + cv_bridge)'
+            )
+        else:
+            missing = []
+            if not _CV2_AVAILABLE:      missing.append('opencv-python')
+            if not _CVBRIDGE_AVAILABLE: missing.append('cv_bridge')
+            if not _PYZBAR_AVAILABLE:   missing.append('pyzbar')
+            if missing:
+                self.get_logger().warn(
+                    f'   Kamera QR modu: KAPALI — eksik: {", ".join(missing)}\n'
+                    f'   Proximity modu aktif (yedek).'
+                )
 
         # ── RUNTIME QR MAP GÜNCELLEME (JÜRİ KOORDİNATI) ──────────────
-        self.create_service(SetQRMap, '/swarm/set_qr_map', 
+        self.create_service(SetQRMap, '/swarm/set_qr_map',
                           self._on_set_qr_map)
 
         # ── TIMER'LAR ────────────────────────────────────────────────────
@@ -164,9 +212,10 @@ class QRPerception(Node):
             self._startup_ready_timer = self.create_timer(2.0, self._publish_startup_ready)
 
         self.get_logger().info(
-            f'\n📷 qr_perception hazır!\n'
-            f'   Takım ID     : {self._team_id}  (YAML key: {self._team_key})\n'
+            f'\nqr_perception hazir!\n'
+            f'   Takim ID     : {self._team_id}  (YAML key: {self._team_key})\n'
             f'   Kamera drone : drone{self._camera_drone_id}\n'
+            f'   Gorsel QR    : {"AKTIF (pyzbar)" if (self._use_camera and _PYZBAR_AVAILABLE and _CVBRIDGE_AVAILABLE) else "KAPALI (proximity yedek)"}\n'
             f'   Yedek        : drone{self._backup_cam_id}\n'
             f'   QR düğüm     : {len(self._qr_nodes)}\n'
             f'   Renk zone    : {len(self._color_zones)}\n'
@@ -324,6 +373,63 @@ class QRPerception(Node):
             self.get_logger().error(f'❌ {response.message}')
             return response
 
+
+    def _on_camera_image(self, msg: RosImage, drone_id: int) -> None:
+        """
+        Kamera görüntüsünden pyzbar ile QR kodu oku.
+
+        Sadece aktif kamera drone'unun görüntüsünü işler.
+        Okunan QR → JSON parse → _publish_qr_result() çağrısı.
+        Proximity modu ile ortak _read_qr_ids seti → tekrar okuma yok.
+        """
+        if drone_id != self._camera_drone_id:
+            return
+        if not (_CV2_AVAILABLE and _CVBRIDGE_AVAILABLE and _PYZBAR_AVAILABLE):
+            return
+        if self._bridge is None:
+            return
+
+        # ROS Image → OpenCV
+        try:
+            cv_img = self._bridge.imgmsg_to_cv2(msg, 'bgr8')
+        except Exception as e:
+            self.get_logger().warn(
+                f'Goruntu donusum hatasi: {e}', throttle_duration_sec=5.0)
+            return
+
+        # Gri tonlama — pyzbar daha hızlı/güvenilir çalışır
+        gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
+        decoded_list = pyzbar.decode(gray)
+
+        for obj in decoded_list:
+            # JSON parse
+            try:
+                import json as _json
+                data = _json.loads(obj.data.decode('utf-8'))
+                qr_id = int(data.get('qr_id', 0))
+            except Exception:
+                continue
+
+            if qr_id == 0 or qr_id in self._read_qr_ids:
+                continue
+
+            self.get_logger().info(
+                f'[KAMERA] QR{qr_id} gorsel olarak okundu (drone{drone_id})'
+            )
+
+            # YAML'daki pozisyonu koru, içeriği kameradan al
+            if qr_id in self._qr_nodes:
+                qr_data = dict(self._qr_nodes[qr_id])
+                qr_data['content'] = data   # Gerçek QR içeriği
+            else:
+                # YAML'da tanımsız QR (yarışma günü jüri ekleyebilir)
+                qr_data = {
+                    'content':  data,
+                    'position': {'x': 0.0, 'y': 0.0, 'z': 0.0},
+                }
+
+            self._publish_qr_result(qr_id, qr_data)
+            self._read_qr_ids.add(qr_id)
 
     def _on_pose(self, msg: PoseStamped, drone_id: int):
         self._drone_poses[drone_id] = msg

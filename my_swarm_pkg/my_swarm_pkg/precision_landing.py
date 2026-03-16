@@ -138,9 +138,10 @@ class PrecisionLandingNode(Node):
         )
 
         # 4) Kendi durumu (DETACH / LAND_ZONE / DISARM_WAIT)
+        # BEST_EFFORT — local_fsm BEST_EFFORT yayınlar
         self.create_subscription(
             LocalState, f'/{self.ns}/local_state',
-            self._on_own_state, rel_qos
+            self._on_own_state, be_qos
         )
 
         # ── Yayıncı ───────────────────────────────────────────────────────────

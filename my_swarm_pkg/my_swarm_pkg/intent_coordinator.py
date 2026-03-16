@@ -73,6 +73,7 @@ import yaml
 import rclpy
 from rclpy.node import Node
 from rclpy.time import Time
+from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy, QoSHistoryPolicy
 
 from std_msgs.msg import UInt8, Bool, Float64
 from geometry_msgs.msg import Point
@@ -278,13 +279,20 @@ class IntentCoordinator(Node):
         #    lambda + default arg (did=i) → Python closure trap'i önler!
         #    (Döngü içinde lambda: her lambda aynı i'yi yakalar → BUG)
         #    (did=i ile her lambda kendi did'ini yakalar → DOĞRU)
+        # VOLATILE QoS: eski mesajlar yeni subscriber'lara iletilmesin
+        volatile_qos = QoSProfile(
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            durability=QoSDurabilityPolicy.VOLATILE,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=5,
+        )
         self._state_subs = []
         for i in range(1, self.num_drones + 1):
             sub = self.create_subscription(
                 LocalState,
                 f'/drone{i}/local_state',
                 lambda msg, did=i: self._on_local_state(msg, did),
-                10
+                volatile_qos
             )
             self._state_subs.append(sub)
 
@@ -389,7 +397,8 @@ class IntentCoordinator(Node):
         )
 
         # ── ÖZEL DURUM: ARMING → NAVIGATING ─────────────────────────────
-        # Drone IDLE oldu (arm tamamlandı) → tüm drone'lar IDLE mi? → NAVIGATING'e geç
+        # Drone IDLE oldu (ARM komutu alındı) → tüm drone'lar IDLE mi? → NAVIGATING'e geç
+        # NOT: local_fsm IDLE→FLYING ancak QR_NAVIGATE ile geçer, bu yüzden IDLE kontrolü gerekli
         if (msg.state == DroneState.IDLE
                 and self._mission_phase == MissionPhase.ARMING
                 and self._is_leader):
@@ -448,6 +457,8 @@ class IntentCoordinator(Node):
             with open(path, 'r', encoding='utf-8') as f:
                 data = yaml.safe_load(f)
             self._qr_map_nodes = data.get('qr_nodes', {})
+            if self._qr_map_nodes:
+                self._qr_map_ready = True  # YAML'dan yüklenince hazır say
             self.get_logger().info(
                 f'[{self.ns}] QR map ön-yüklendi: {len(self._qr_map_nodes)} düğüm'
             )
@@ -846,6 +857,20 @@ class IntentCoordinator(Node):
         """
         if not self._is_leader or not self._task_active:
             return
+
+        # ARMING→NAVIGATING hızlı geçiş: tüm drone'lar zaten IDLE/FLYING ise
+        # (trigger geç alındığında drone'lar önceden IDLE'a geçmiş olabilir)
+        if self._mission_phase == MissionPhase.ARMING:
+            idle_or_flying = sum(
+                1 for did in range(1, self.num_drones + 1)
+                if self._drone_state.get(did) in {DroneState.IDLE, DroneState.FLYING}
+            )
+            if idle_or_flying >= self.num_drones:
+                self._mission_phase = MissionPhase.NAVIGATING
+                self.get_logger().info(
+                    f'🚀 [{self.ns}] Tüm drone\'lar IDLE/FLYING → NAVIGATING! '
+                    f'QR1 @ ({self._target_pos.x:.1f}, {self._target_pos.y:.1f})'
+                )
 
         intent = self._build_intent()
         if intent is None:

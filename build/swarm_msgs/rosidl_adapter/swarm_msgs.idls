@@ -1,0 +1,11 @@
+/home/beyza/eren-takim-reposu/build/swarm_msgs/rosidl_adapter/swarm_msgs:msg/LocalState.idl
+/home/beyza/eren-takim-reposu/build/swarm_msgs/rosidl_adapter/swarm_msgs:msg/SwarmIntent.idl
+/home/beyza/eren-takim-reposu/build/swarm_msgs/rosidl_adapter/swarm_msgs:msg/JoinRequest.idl
+/home/beyza/eren-takim-reposu/build/swarm_msgs/rosidl_adapter/swarm_msgs:msg/SafetyEvent.idl
+/home/beyza/eren-takim-reposu/build/swarm_msgs/rosidl_adapter/swarm_msgs:msg/FormationCmd.idl
+/home/beyza/eren-takim-reposu/build/swarm_msgs/rosidl_adapter/swarm_msgs:msg/QRResult.idl
+/home/beyza/eren-takim-reposu/build/swarm_msgs/rosidl_adapter/swarm_msgs:msg/TaskTrigger.idl
+/home/beyza/eren-takim-reposu/build/swarm_msgs/rosidl_adapter/swarm_msgs:msg/TeleopCmd.idl
+/home/beyza/eren-takim-reposu/build/swarm_msgs/rosidl_adapter/swarm_msgs:msg/ColorZone.idl
+/home/beyza/eren-takim-reposu/build/swarm_msgs/rosidl_adapter/swarm_msgs:msg/ColorZoneList.idl
+/home/beyza/eren-takim-reposu/build/swarm_msgs/rosidl_adapter/swarm_msgs:srv/SetQRMap.idl

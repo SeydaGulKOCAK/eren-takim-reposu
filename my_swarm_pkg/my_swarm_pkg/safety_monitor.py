@@ -50,6 +50,7 @@ from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 
 from geometry_msgs.msg import PoseStamped
 from std_msgs.msg import Float32, Header
+from mavros_msgs.msg import State
 from swarm_msgs.msg import SafetyEvent, SwarmIntent
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -116,6 +117,7 @@ class SafetyMonitorNode(Node):
 
         self._own_pose: tuple[float, float, float] | None = None
         self._own_pose_time: float = 0.0
+        self._armed: bool = False
 
         self._last_intent_time: float = 0.0
 
@@ -153,6 +155,12 @@ class SafetyMonitorNode(Node):
             '/swarm/intent',
             self._on_intent,
             10,
+        )
+        self.create_subscription(
+            State,
+            f'/{self.ns}/mavros/state',
+            lambda msg: setattr(self, '_armed', msg.armed),
+            best_effort_qos,
         )
 
         # ── Yayıncılar ────────────────────────────────────────────────────────
@@ -262,17 +270,21 @@ class SafetyMonitorNode(Node):
         if self._own_pose is None:
             return
 
+        # Silahsız drone geofence kontrolü yapma (yerde z=0 olur, ihlal sanılır)
+        if not self._armed:
+            return
+
         # Stale pose → geofence kontrolü yapma
         if now - self._own_pose_time > 2.0:
             return
 
         x, y, z = self._own_pose
 
-        # Sınır ihlali tespiti
+        # Sınır ihlali tespiti (z_min kontrolü yok — takeoff sırasında z=0 normaldir)
         breach = (
             x < FENCE_X_MIN or x > FENCE_X_MAX or
             y < FENCE_Y_MIN or y > FENCE_Y_MAX or
-            z > FENCE_ALT_MAX or z < FENCE_ALT_MIN
+            z > FENCE_ALT_MAX
         )
 
         # Yaklaşma uyarısı (sınırdan FENCE_MARGIN_M önce, 10s'de bir)
@@ -307,7 +319,6 @@ class SafetyMonitorNode(Node):
         if y < FENCE_Y_MIN:  details.append(f'y={y:.1f}<{FENCE_Y_MIN}')
         if y > FENCE_Y_MAX:  details.append(f'y={y:.1f}>{FENCE_Y_MAX}')
         if z > FENCE_ALT_MAX: details.append(f'z={z:.1f}>{FENCE_ALT_MAX}')
-        if z < FENCE_ALT_MIN: details.append(f'z={z:.1f}<{FENCE_ALT_MIN}')
 
         # Merkezden uzaklık (severity için)
         cx = (FENCE_X_MAX + FENCE_X_MIN) / 2

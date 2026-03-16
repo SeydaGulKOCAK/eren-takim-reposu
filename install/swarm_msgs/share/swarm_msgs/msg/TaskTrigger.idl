@@ -1,0 +1,40 @@
+// generated from rosidl_adapter/resource/msg.idl.em
+// with input from swarm_msgs/msg/TaskTrigger.msg
+// generated code does not contain a copyright notice
+
+#include "std_msgs/msg/Header.idl"
+
+module swarm_msgs {
+  module msg {
+    @verbatim (language="comment", text=
+      "TaskTrigger.msg" "\n"
+      "Yayıncı : mission_fsm (GCS — Yer Kontrol İstasyonu)" "\n"
+      "Okuyan  : intent_coordinator (TÜM İHA'lar)" "\n"
+      "" "\n"
+      "Görevi başlatan veya durduran TEK GCS komutu." "\n"
+      "Şartname: TASK1_ACTIVE modunda GCS başka hiçbir kontrol komutu göndermez." "\n"
+      "Bu mesaj gelince intent_coordinator mode_gating'i devreye alır." "\n"
+      "" "\n"
+      "YARIŞMA PROSEDÜRÜ:" "\n"
+      "  Hakem \"başlat\" dediğinde operatör bu komutu gönderir." "\n"
+      "  Sonrasında GCS müdahalesi imkânsız hale gelir (mode gating)." "\n"
+      "" "\n"
+      "TASK1: Otonom sürü görevi (QR navigasyon + birey çıkarma/ekleme)" "\n"
+      "TASK2: Yarı otonom görev (joystick ile sürü kontrolü)")
+    struct TaskTrigger {
+      std_msgs::msg::Header header;
+
+      @verbatim (language="comment", text=
+        "'TASK1' veya 'TASK2'")
+      string task_type;
+
+      @verbatim (language="comment", text=
+        "True = görevi başlat, False = görevi durdur")
+      boolean start;
+
+      @verbatim (language="comment", text=
+        "Takım ID'si (doğrulama için)")
+      string team_id;
+    };
+  };
+};

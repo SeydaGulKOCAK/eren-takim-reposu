@@ -1,0 +1,35 @@
+// generated from rosidl_adapter/resource/msg.idl.em
+// with input from swarm_msgs/msg/ColorZone.msg
+// generated code does not contain a copyright notice
+
+#include "geometry_msgs/msg/Point.idl"
+
+module swarm_msgs {
+  module msg {
+    @verbatim (language="comment", text=
+      "ColorZone.msg" "\n"
+      "Yayıncı : qr_perception" "\n"
+      "Okuyan  : intent_coordinator (DETACH görevinde iniş bölgesi seçimi için)" "\n"
+      "" "\n"
+      "Rota boyunca tespit edilen tek bir renk bölgesi." "\n"
+      "Sürü bu bölgeleri hafızaya alır; birey çıkarma komutunda kullanır." "\n"
+      "" "\n"
+      "Şartname §5.1.2:" "\n"
+      "  \"...birey ayrılacak iniş alanının rengini ve konumunu kaydeder\"")
+    struct ColorZone {
+      @verbatim (language="comment", text=
+        "ENU koordinat — z genellikle 0 (zemin)")
+      @unit (value="m")
+      geometry_msgs::msg::Point position;
+
+      @verbatim (language="comment", text=
+        "'RED' veya 'BLUE'")
+      string color;
+
+      @verbatim (language="comment", text=
+        "Hassas iniş bölgesi yarıçapı")
+      @unit (value="m")
+      float radius;
+    };
+  };
+};
