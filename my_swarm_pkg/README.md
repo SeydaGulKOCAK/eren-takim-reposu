@@ -36,6 +36,7 @@
 17. [Sık Karşılaşılan Hatalar](#17-sık-karşılaşılan-hatalar)
 18. [Bilinen Eksiklikler / Yapılacaklar](#18-bilinen-eksiklikler--yapılacaklar)
 19. [Hızlı Başvuru Komutları](#19-hızlı-başvuru-komutları)
+20. [Akış Şemaları (Mermaid)](#20-akış-şemaları-mermaid)
 
 ---
 
@@ -1427,6 +1428,277 @@ Batarya kritik:       %15
 Jeofence X:           -5 → 125 m
 Jeofence Y:           -5 → 95 m
 Jeofence Z:           0.5 → 60 m
+```
+
+---
+
+## 20. Akış Şemaları (Mermaid)
+
+> GitHub bu şemaları otomatik olarak görsel olarak render eder.
+
+---
+
+### 20.1 Genel Sistem Mimarisi — Tüm Node'lar ve Bağlantılar
+
+```mermaid
+graph TD
+    subgraph GCS["🖥️ GCS (mission_fsm)"]
+        MF[mission_fsm\n[s]=başlat [a]=durdur\n[h]=irtifa [m]=QR koord]
+    end
+
+    subgraph SWARM_BUS["📡 Swarm Bus (tüm drone'lar dinler)"]
+        TT[/swarm/task_trigger/]
+        SI[/swarm/intent/]
+        LID[/swarm/leader_id/]
+        QMR[/swarm/qr_map_ready/]
+        QR[/qr/result/]
+        SE[/safety/event/]
+        ALT[/gcs/drone_altitude/]
+    end
+
+    subgraph D1["🚁 Drone 1 (her drone için aynı yapı)"]
+        IC[intent_coordinator\nBully lider seçimi\nMissionPhase FSM]
+        LF[local_fsm\nLocalState FSM]
+        FC[formation_controller\n50Hz sanal lider\nOKBASI/V/CIZGI]
+        CA[collision_avoidance\nAPF itme kuvveti]
+        DI[drone_interface\nMAVROS köprüsü\nAltitude Gate ✅]
+        SM[safety_monitor\nJeofence + Batarya]
+        WN[waypoint_navigator\nQR waypoint sırası]
+        QP[qr_perception\nYAKINLIK → QR oku]
+        PL[precision_landing\nRenk zone iniş]
+    end
+
+    subgraph MAVROS["⚙️ MAVROS + ArduPilot SITL"]
+        MV[mavros_node\nUDP 14550/60/70]
+        AP[ArduCopter SITL\nGazebo Plugin\nJSON UDP 9002/12/22]
+    end
+
+    MF -->|TaskTrigger| TT
+    MF -->|Float64| ALT
+    TT --> IC
+    ALT --> IC
+
+    IC -->|SwarmIntent 2Hz| SI
+    IC -->|UInt8| LID
+    SI --> LF
+    SI --> FC
+    SI --> WN
+
+    QMR --> IC
+    QP -->|QRResult| QR
+    QR --> IC
+    QP -->|Bool| QMR
+
+    LF -->|cmd_arm| DI
+    LF -->|cmd_mode| DI
+    LF -->|setpoint override| DI
+
+    FC -->|setpoint_raw 50Hz| CA
+    CA -->|setpoint_final 50Hz| DI
+
+    SM -->|SafetyEvent| SE
+    SE --> LF
+
+    PL -->|landing_target 10Hz| DI
+
+    DI -->|arming srv| MV
+    DI -->|set_mode srv| MV
+    DI -->|setpoint_position/local| MV
+    MV -->|state, pose, velocity| DI
+    DI -->|/droneN/pose| FC
+    DI -->|/droneN/pose| CA
+    DI -->|/droneN/pose| SM
+    DI -->|/droneN/pose| WN
+    DI -->|/droneN/pose| PL
+    DI -->|local_state 10Hz| IC
+
+    MV <-->|UDP MAVLink| AP
+```
+
+---
+
+### 20.2 Görev Akışı — [s] Tuşundan QR'a Kadar Detaylı Zaman Çizelgesi
+
+```mermaid
+sequenceDiagram
+    actor Op as Operatör
+    participant MF as mission_fsm
+    participant IC as intent_coordinator
+    participant LF as local_fsm (×3)
+    participant DI as drone_interface (×3)
+    participant MV as MAVROS (×3)
+    participant AP as ArduCopter SITL (×3)
+
+    Op->>MF: [h] → 15m irtifa
+    Op->>MF: [m] → QR1..6 koordinatları
+    Note over MF: qr_map servisi çağrılır
+    MF->>IC: task_trigger (TASK1, start=True)
+
+    Note over IC: MissionPhase: IDLE → ARMING
+    IC->>LF: SwarmIntent(task=IDLE, seq=1)
+    LF->>DI: cmd_mode = GUIDED
+    LF->>DI: cmd_arm = True
+    DI->>MV: set_mode(GUIDED)
+    DI->>MV: arming(True)
+    MV->>AP: MAVLink ARM
+    AP-->>MV: ARM kabul
+    MV-->>DI: state(armed=True)
+    DI->>MV: CMD_NAV_TAKEOFF(alt=15m)
+    AP-->>MV: TAKEOFF kabul → GUIDED_TAKEOFF modu
+    DI-->>LF: local_state = IDLE
+
+    Note over IC: Tüm drone'lar IDLE → MissionPhase: ARMING → NAVIGATING
+    IC->>LF: SwarmIntent(task=QR_NAVIGATE, target=QR1, alt=15m, form=OKBASI)
+    LF->>LF: state IDLE → FLYING
+
+    Note over DI: ⛔ Altitude Gate Aktif!<br/>formation setpoints bloklanır<br/>drone yükselene kadar (< 0.5m)
+    AP->>AP: GUIDED_TAKEOFF → drone yükselir
+    AP-->>MV: pose.z > 0.5m
+    MV-->>DI: local_position/pose (z > 0.5m)
+    Note over DI: ✅ Altitude Gate Açıldı!<br/>Setpoints MAVROS'a iletilir
+
+    Note over IC: formation_controller sanal lider QR1'e hareket eder
+    DI->>MV: setpoint_position/local (QR1 formasyonu)
+    MV->>AP: SET_POSITION_TARGET_LOCAL_NED
+    AP->>AP: GUIDED_POSITION → QR1'e uçuş
+
+    Note over IC: drone3 QR1'e 5m yaklaştı
+    IC->>LF: SwarmIntent(task=QR_NAVIGATE, target=QR2, form=V)
+    Note over IC: QR2 → QR3 → ... → QR6 aynı şekilde
+
+    Note over IC: QR6: next_qr_id=0 → RETURNING
+    IC->>LF: SwarmIntent(task=RETURN_HOME)
+    LF->>DI: cmd_mode = RTL
+    DI->>MV: set_mode(RTL)
+```
+
+---
+
+### 20.3 Local FSM Durum Makinesi (her drone'da çalışır)
+
+```mermaid
+stateDiagram-v2
+    [*] --> STANDBY : başlangıç
+
+    STANDBY --> IDLE : SwarmIntent(IDLE)\nARM + GUIDED mod
+
+    IDLE --> FLYING : SwarmIntent(QR_NAVIGATE)\ntakeoff + setpoint aktif
+
+    FLYING --> DETACH : SwarmIntent(DETACH)\ndetach_drone_id == bu drone
+    FLYING --> RETURN_HOME : SwarmIntent(RETURN_HOME)
+    FLYING --> SAFETY_HOLD : SafetyEvent
+    FLYING --> PILOT_OVERRIDE : pilot_override=True
+
+    DETACH --> LAND_ZONE : renk zone'a < 3m
+    LAND_ZONE --> DISARM_WAIT : irtifa < 0.5m (indi)
+    DISARM_WAIT --> REARM : rejoin komutu
+    REARM --> REJOIN : ARM + GUIDED
+    REJOIN --> FLYING : sürüye katıldı
+
+    RETURN_HOME --> LANDING : irtifa < 2m
+    LANDING --> [*] : indi
+
+    SAFETY_HOLD --> FLYING : SafetyEvent temizlendi
+    PILOT_OVERRIDE --> FLYING : pilot_override=False
+
+    note right of FLYING
+        formation_controller
+        50Hz setpoint gönderir
+        (Altitude Gate ile korunur)
+    end note
+```
+
+---
+
+### 20.4 Setpoint Pipeline — Komut Drone'a Nasıl Ulaşır?
+
+```mermaid
+flowchart LR
+    subgraph IC_LF["intent_coordinator + local_fsm"]
+        INT[SwarmIntent\ntarget_pos, formation,\naltitude, yaw]
+    end
+
+    subgraph FC["formation_controller\n50 Hz"]
+        VL[Sanal Lider\n3 m/s hareket]
+        OFF[Formasyon Offseti\nOKBASI / V / CIZGI]
+        SR[Slew Rate\n0.10 m/adım]
+        SP_RAW[setpoint_raw\nPoseStamped]
+        VL --> OFF --> SR --> SP_RAW
+    end
+
+    subgraph CA["collision_avoidance\n50 Hz"]
+        APF["APF Kuvveti\nF = K_REP×(1/d - 1/R_MAX)/d²"]
+        CLIP["clip(ΣF, 3.0m)"]
+        SP_FINAL[setpoint_final\nPoseStamped]
+        APF --> CLIP --> SP_FINAL
+    end
+
+    subgraph DI["drone_interface"]
+        GATE{"Altitude Gate\nz > 0.5m?"}
+        MAVPUB[MAVROS Publish\nsetpoint_position/local]
+        BLOCK[❌ BLOK\nsadece TAKEOFF çalışır]
+    end
+
+    subgraph MV_AP["MAVROS → ArduCopter"]
+        MVCMD[SET_POSITION_TARGET\nLOCAL_NED]
+        GUID[GUIDED_POSITION\nmodu]
+        FLY[🚁 Drone Uçuyor!]
+    end
+
+    INT --> VL
+    SP_RAW --> APF
+    SP_FINAL --> GATE
+    GATE -- "EVET (havada)" --> MAVPUB --> MVCMD --> GUID --> FLY
+    GATE -- "HAYIR (yerde)" --> BLOCK
+```
+
+---
+
+### 20.5 Kalkış Akışı — Altitude Gate Detayı
+
+```mermaid
+flowchart TD
+    A([🔑 [s] Tuşu]) --> B[TaskTrigger gönder]
+    B --> C[intent_coordinator:\nMissionPhase = ARMING]
+    C --> D[SwarmIntent IDLE → 3 drone'a]
+    D --> E[local_fsm: STANDBY → IDLE]
+    E --> F[drone_interface:\ncmd_mode = GUIDED\ncmd_arm = True]
+    F --> G[MAVROS → ArduCopter: ARM]
+    G --> H{ARM kabul?}
+    H -- Hayır --> I[❌ Hata: ARM reddedildi\nlog'a yaz]
+    H -- Evet --> J[CMD_NAV_TAKEOFF\nalt = drone_altitude]
+    J --> K[ArduCopter: GUIDED_TAKEOFF modu]
+    K --> L[intent_coordinator:\nTüm IDLE gördü →\nMissionPhase = NAVIGATING]
+    L --> M[SwarmIntent QR_NAVIGATE → 3 drone'a]
+    M --> N[local_fsm: IDLE → FLYING]
+    N --> O[formation_controller:\n50Hz setpoint yayınlamaya başlar]
+    O --> P{drone_interface\nAltitude Gate:\nz > 0.5m?}
+    P -- "HAYIR\n(drone henüz yerde)" --> Q[⛔ Setpoint BLOKLA\nTAKEOFF devam eder]
+    Q --> R[ArduCopter yükselmeye devam eder]
+    R --> P
+    P -- "EVET\n(drone havada)" --> S[✅ Setpoint MAVROS'a ilet]
+    S --> T[GUIDED_POSITION modu:\nQR1 formatyon setpointi]
+    T --> U[🚁🚁🚁 3 Drone Formasyon Halinde\nQR1'e Uçuyor!]
+```
+
+---
+
+### 20.6 Lider Seçimi — Bully Algoritması
+
+```mermaid
+flowchart TD
+    A[Her drone\n/droneN/local_state dinler\n600ms timeout] --> B{Hangi drone'lar\nFLYING/REJOIN\ndurumunda?}
+    B --> C["Aktif drone'lar listesi\n[drone1=FLYING,\ndrone2=FLYING,\ndrone3=FLYING]"]
+    C --> D["min(drone_id) = Lider\n→ drone1 seçildi"]
+    D --> E[drone1: SwarmIntent yayınlar\n/swarm/intent 2Hz]
+    D --> F[drone2,3: sadece dinler]
+
+    G[drone1 düşerse\n600ms heartbeat yok] --> H["Aktif liste:\n[drone2=FLYING, drone3=FLYING]"]
+    H --> I["min(drone_id) = drone2\n→ yeni lider"]
+    I --> J[drone2: SwarmIntent yayınlamaya başlar]
+
+    style D fill:#2d6a2d,color:#fff
+    style I fill:#2d6a2d,color:#fff
 ```
 
 ---
