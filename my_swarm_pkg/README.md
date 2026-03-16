@@ -655,12 +655,16 @@ DISPLAY=:0 ros2 launch my_swarm_pkg swarm_competition.launch.py
 | 0s | ArduCopter drone1 başlar |
 | 2s | ArduCopter drone2 başlar |
 | 4s | ArduCopter drone3 başlar |
-| 8s | 3× MAVROS başlar |
 | 9.0s | drone1 node'ları başlar |
 | 9.5s | drone2 node'ları başlar |
 | 10.0s | drone3 node'ları başlar |
 | 10.5s | qr_perception başlar |
 | 10.7s | Mission FSM Dashboard açılır |
+| 12s | MAVROS drone1 başlar (ArduCopter HEARTBEAT için beklenir) |
+| 14s | MAVROS drone2 başlar |
+| 16s | MAVROS drone3 başlar |
+
+> **Not:** MAVROS'lar kasıtlı olarak geç başlar. ArduCopter SITL tam ayağa kalkmadan MAVROS bağlanırsa bağlantı kopuklukları yaşanıyordu.
 
 **Başarılı başlangıç logları (terminalde şunları görmeli):**
 
@@ -1274,6 +1278,29 @@ ROS_LOCALHOST_ONLY=1 ros2 topic echo /drone1/mavros/state --once
 # connected: true görmeli
 ```
 
+### Drone'lar ARM oluyor ama 10 saniye sonra disarm oluyor (ÇÖZÜLDÜ)
+**Neden oluyordu:** `formation_controller` ARM'dan ~478ms sonra `SET_POSITION_TARGET_LOCAL_NED` gönderiyordu. Bu mesaj ArduPilot'taki `CMD_NAV_TAKEOFF` komutunu iptal ediyordu.
+**Çözüm:** `drone_interface.py`'a yükseklik kapısı eklendi — drone 0.5m'yi geçmeden formasyon setpoint'leri MAVROS'a iletilmiyor.
+
+### `PackageNotFoundError: No package metadata was found for my_swarm_pkg`
+**Neden olur:** Modern setuptools (80.9+) `setup.cfg` içindeki `[develop]` bölümünü tanımıyor.
+```bash
+# Düzelt:
+cd ~/gz_ws/src/my_swarm_pkg
+pip3 install -e .
+# Doğrula:
+python3 -c "import importlib.metadata; importlib.metadata.distribution('my-swarm-pkg'); print('OK')"
+```
+
+### `colcon build` — "option --uninstall not recognized"
+`setup.cfg` içinde `[develop]` bölümü varsa setuptools 80.9+ bunu reddeder.
+```bash
+# setup.cfg'de [develop] satırlarını sil, sadece [install] kalmalı:
+# [install]
+# install_scripts=$base/lib/my_swarm_pkg
+cd ~/gz_ws && colcon build --packages-select my_swarm_pkg
+```
+
 ### colcon build başarısız
 ```bash
 # Sadece ilgili paketi build et, hata mesajını gör:
@@ -1317,6 +1344,35 @@ python3 -c "from swarm_msgs.msg import SwarmIntent; print('OK')"
 ---
 
 ## 19. Hızlı Başvuru Komutları
+
+### Repo'yu güncelledikten sonra (git pull sonrası MUTLAKA yap)
+
+```bash
+# 1. Değişiklikleri çek
+cd ~/gz_ws/src/my_swarm_pkg
+git pull origin main
+
+# 2. Paketi rebuild et
+cd ~/gz_ws
+colcon build --packages-select my_swarm_pkg swarm_msgs
+source install/setup.bash
+
+# 3. Python editable install güncelle (setup.cfg değiştiyse)
+cd ~/gz_ws/src/my_swarm_pkg
+pip3 install -e .
+```
+
+### Simülasyonu başlatmadan önce ESKİ SÜREÇLERİ MUTLAKA KAPAT
+
+```bash
+# Tüm eski süreçleri temizle (her seferinde bunu çalıştır):
+ps aux | grep -E "(gz|ArduCopter|arducopter|mavros|my_swarm_pkg|mission_fsm|ros2 run|ros2 launch|xterm)" \
+  | grep -v grep | awk '{print $2}' | xargs kill -9 2>/dev/null
+sleep 2
+# Temiz mi kontrol et:
+ps aux | grep -E "(gz|arducopter|mavros|my_swarm_pkg)" | grep -v grep
+# Hiçbir şey çıkmamalı
+```
 
 ```bash
 # ─── Simülasyonu başlat ───
