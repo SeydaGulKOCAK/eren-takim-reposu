@@ -218,6 +218,8 @@ class IntentCoordinator(Node):
         # ══════════════════════════════════════════════════════
         # GÖREV DURUMU
         # ══════════════════════════════════════════════════════
+        import time as _time_mod
+        self._node_start_time: float = _time_mod.time()  # Başlangıç zamanı (stale trigger tespiti için)
         self._task_active:   bool = False
         self._mission_phase: str  = MissionPhase.IDLE
         self._current_qr_id: int  = 1     # Şu anki hedef QR no
@@ -495,6 +497,17 @@ class IntentCoordinator(Node):
         yazılımsal olarak kapatılır (mission_fsm bunu yönetir).
         Şartname §5.3: Görev sırasında GCS müdahalesi imkânsız.
         """
+        import time as _time
+        # FastRTPS paylaşımlı bellek eski simülasyondan kalan mesaj iletebilir.
+        # Node başladıktan 15 saniye içinde gelen trigger büyük ihtimalle eski → yoksay.
+        if _time.time() - self._node_start_time < 15.0:
+            self.get_logger().warn(
+                f'[{self.ns}] ⚠️ task_trigger node başlangıcından '
+                f'{_time.time()-self._node_start_time:.1f}s sonra geldi — '
+                f'eski simülasyon kalıntısı, yoksayılıyor.'
+            )
+            return
+
         if msg.task_type != 'TASK1':
             self.get_logger().info(
                 f'[{self.ns}] task_trigger: {msg.task_type} — '

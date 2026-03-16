@@ -86,6 +86,7 @@ class DroneInterface(Node):
         self.last_mode = ''            # Son gönderilen mod (tekrar engeli)
         self.pilot_override_active = False  # RC kill-switch aktif mi?
         self._arm_pending = False      # ARM komutu GUIDED onayı bekliyor
+        self._current_altitude = 0.0   # MAVROS ENU z (metre) - yükseklik kapısı için
         # State-triggered yayın için: son yayınlanan değeri sakla.
         # Böylece sadece değişince yayınlarız, gereksiz Wi-Fi trafiği önlenir.
         self._last_published_override = None
@@ -273,6 +274,7 @@ class DroneInterface(Node):
         Pixhawk'tan gelen konumu sisteme ilet.
         MAVROS zaten NED→ENU dönüşümünü yapıyor, biz sadece iletiyoruz.
         """
+        self._current_altitude = msg.pose.position.z  # ENU: z = yukarı (metre)
         msg.header.frame_id = 'map'
         self.pose_pub.publish(msg)
 
@@ -347,7 +349,15 @@ class DroneInterface(Node):
           collision_avoidance  → setpoint_final (APF sonrası gerçek hedef)
                ↓
           drone_interface (biz) → MAVROS → Pixhawk → drone uçar!
+
+        YÜKSEKLİK KAPISI:
+          CMD_NAV_TAKEOFF aktifken SET_POSITION_TARGET_LOCAL_NED gönderilirse
+          ArduPilot GUIDED_TAKEOFF → GUIDED_POSITION geçişi yapar ve kalkış iptal olur!
+          Bu yüzden drone yere yakınken (< 0.5m) setpoint iletmiyoruz.
+          Drone 0.5m üzerine çıkınca (kalkış tamamlandı) formation_controller devralır.
         """
+        if self._current_altitude < 0.5:
+            return  # Kalkış tamamlanmadı, setpoint gönderme (TAKEOFF iptal olmasın)
         self.mavros_setpoint_pub.publish(msg)
 
     def _cmd_mode_cb(self, msg: String):
@@ -369,33 +379,28 @@ class DroneInterface(Node):
             f'🧭 [{self.ns}] Mod komutu: {msg.data}'
         )
         self.last_mode = msg.data
+        self._send_mode_with_retry(msg.data, retries_left=10)
 
+    def _send_mode_with_retry(self, mode: str, retries_left: int = 10):
+        """set_mode servisi hazır değilse 2sn sonra tekrar dene (en fazla 10 kez)."""
         if self.set_mode_client.service_is_ready():
             req = SetMode.Request()
-            req.custom_mode = msg.data
-            requested_mode = msg.data  # closure için kopyala
+            req.custom_mode = mode
 
-            # async çağrı: node bloklanmaz, cevap gelince callback çalışır.
             future = self.set_mode_client.call_async(req)
 
-            # NEDEN FUTURE DİNLEMELİYİZ?
-            # Pixhawk isteği reddedebilir: yetersiz GPS, düşük batarya,
-            # sensör hatası vb. Yanıt dinlenmezse sistemimiz başarılı
-            # sandığı için setpoint göndermeye devam eder → tehlikeli!
             def _on_set_mode_done(f):
                 try:
                     result = f.result()
                     if result.mode_sent:
                         self.get_logger().info(
-                            f'✅ [{self.ns}] Mod değişti: {requested_mode}'
+                            f'✅ [{self.ns}] Mod değişti: {mode}'
                         )
                     else:
-                        # Pixhawk reddetti! last_mode'u sıfırla ki
-                        # bir sonraki komutta tekrar denensin.
                         self.last_mode = ''
                         self.get_logger().error(
                             f'❌ [{self.ns}] Pixhawk modu reddetti: '
-                            f'{requested_mode} → GPS/batarya/sensör sorunu olabilir!'
+                            f'{mode} → GPS/batarya/sensör sorunu olabilir!'
                         )
                 except Exception as e:
                     self.last_mode = ''
@@ -404,9 +409,22 @@ class DroneInterface(Node):
                     )
 
             future.add_done_callback(_on_set_mode_done)
-        else:
+        elif retries_left > 0:
             self.get_logger().warn(
-                f'⚠️  [{self.ns}] set_mode servisi hazır değil! '
+                f'⚠️  [{self.ns}] set_mode servisi hazır değil, '
+                f'2sn sonra tekrar denenecek (kalan: {retries_left})'
+            )
+            _timer_holder = [None]
+
+            def _retry():
+                _timer_holder[0].cancel()
+                self._send_mode_with_retry(mode, retries_left - 1)
+
+            _timer_holder[0] = self.create_timer(2.0, _retry)
+        else:
+            self.last_mode = ''
+            self.get_logger().error(
+                f'❌ [{self.ns}] set_mode servisi 20sn içinde hazır olmadı! '
                 f'MAVROS bağlı mı?'
             )
 
@@ -549,17 +567,27 @@ class DroneInterface(Node):
 
         future.add_done_callback(_on_force_arm_done)
 
-    def takeoff(self):
+    def takeoff(self, _retry: int = 0):
         """
         ARM sonrası kalkış komutu gönder (MAV_CMD_NAV_TAKEOFF).
         ArduCopter ARM'dan sonra ~2 saniye içinde takeoff almazsa auto-disarm yapar.
         Bu metod ARM callback'inden hemen çağrılır.
         """
         if not self.takeoff_client.service_is_ready():
-            self.get_logger().warn(
-                f'⚠️  [{self.ns}] takeoff servisi hazır değil, 1sn sonra tekrar denenecek'
-            )
-            self.create_timer(1.0, lambda: self.takeoff())
+            if _retry < 5:
+                self.get_logger().warn(
+                    f'⚠️  [{self.ns}] takeoff servisi hazır değil, '
+                    f'1sn sonra tekrar denenecek (kalan: {5 - _retry})'
+                )
+                _t = [None]
+
+                def _retry_cb():
+                    _t[0].cancel()
+                    self.takeoff(_retry + 1)
+
+                _t[0] = self.create_timer(1.0, _retry_cb)
+            else:
+                self.get_logger().error(f'❌ [{self.ns}] takeoff servisi 5sn içinde hazır olmadı!')
             return
 
         req = CommandTOL.Request()

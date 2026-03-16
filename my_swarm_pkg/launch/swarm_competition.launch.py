@@ -114,6 +114,16 @@ def generate_launch_description():
     args = []
 
     # ═══════════════════════════════════════════════════════════════════════
+    # 0️⃣ ÖNCE: Eski FastRTPS shm dosyalarını temizle (stale mesaj sorunu önleme)
+    # ═══════════════════════════════════════════════════════════════════════
+    args.append(
+        ExecuteProcess(
+            cmd=['bash', '-c', 'rm -f /dev/shm/fastrtps_* 2>/dev/null; echo "FastRTPS shm temizlendi"'],
+            output='screen',
+        )
+    )
+
+    # ═══════════════════════════════════════════════════════════════════════
     # BAŞLANGIC BANNER
     # ═══════════════════════════════════════════════════════════════════════
     args.append(
@@ -223,12 +233,12 @@ def generate_launch_description():
 
         mavros_nodes.append(
             TimerAction(
-                period=8.0 + (sysid - 1) * 0.5,  # SITL hazır olduktan sonra
+                period=12.0 + (sysid - 1) * 2.0,  # SITL hazır olduktan sonra (drone1: 12s, drone2: 14s, drone3: 16s)
                 actions=[
                     Node(
                         package='mavros',
                         executable='mavros_node',
-                        namespace=ns,
+                        namespace=f'{ns}/mavros',
                         parameters=[{
                             # SITL udpclient olarak 14550'e gönderiyor
                             # MAVROS o porta dinliyor: udp://:14550@
