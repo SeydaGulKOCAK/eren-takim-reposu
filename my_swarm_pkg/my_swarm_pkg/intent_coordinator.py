@@ -146,7 +146,7 @@ class IntentCoordinator(Node):
     #   local_fsm publish_rate = 100ms
     #   Güvenli margin = timeout / publish_rate = 600/100 = 6 paket
     #   → 6 paketten az kayıp → FALSE ALARM yok
-    HEARTBEAT_TIMEOUT_MS: float = 600.0
+    HEARTBEAT_TIMEOUT_MS: float = 15000.0
 
     def __init__(self):
         super().__init__('intent_coordinator')
@@ -500,7 +500,7 @@ class IntentCoordinator(Node):
         import time as _time
         # FastRTPS paylaşımlı bellek eski simülasyondan kalan mesaj iletebilir.
         # Node başladıktan 15 saniye içinde gelen trigger büyük ihtimalle eski → yoksay.
-        if _time.time() - self._node_start_time < 15.0:
+        if _time.time() - self._node_start_time < 3.0:
             self.get_logger().warn(
                 f'[{self.ns}] ⚠️ task_trigger node başlangıcından '
                 f'{_time.time()-self._node_start_time:.1f}s sonra geldi — '
@@ -748,6 +748,8 @@ class IntentCoordinator(Node):
             if elapsed_ns > timeout_ns:
                 old_state = self._drone_state[did]
                 self._drone_state[did] = DroneState.SAFETY_HOLD
+                # SEQ sıfırla → local_fsm yeniden başlamışsa heartbeat'ler artık DROP edilmesin
+                self._drone_hb_seq[did] = 0
                 self.get_logger().warn(
                     f'⏱️  [{self.ns}] TIMEOUT! drone{did} '
                     f'{elapsed_ns / 1e6:.0f}ms yanıt vermedi. '

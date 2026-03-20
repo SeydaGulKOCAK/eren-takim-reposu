@@ -83,33 +83,60 @@ def generate_launch_description():
     # ── GEOFENCİNG PARAMETRE (Güvenlik) ───────────────────────────────────
     # Yarışma alanının sınırları
     FENCE = {
-        'FENCE_X_MIN': '-5.0',
+        'FENCE_X_MIN': '-30.0',
         'FENCE_X_MAX': '125.0',
-        'FENCE_Y_MIN': '-5.0',
-        'FENCE_Y_MAX': '95.0',
+        'FENCE_Y_MIN': '-30.0',
+        'FENCE_Y_MAX': '110.0',
         'FENCE_Z_MIN': '0.5',
         'FENCE_Z_MAX': '60.0',
     }
 
     # ── ORTAM AYARLARI ────────────────────────────────────────────────────
+    # pkg_dir: ament_index ile paketin kaynak dizini bulunur.
+    # Workspace adı ne olursa olsun çalışır.
+    from ament_index_python.packages import get_package_share_directory
+    pkg_dir = get_package_share_directory('my_swarm_pkg')
+    # pkg_dir → install/my_swarm_pkg/share/my_swarm_pkg
+    # ws      → install/my_swarm_pkg/share/../../../.. → workspace kökü
+    ws = os.path.abspath(os.path.join(pkg_dir, '..', '..', '..', '..'))
+
+    # eeprom.bin temizliği — bozuk SITL state'ini önler
+    for ep in [
+        '/home/beyza/ardupilot/eeprom.bin',
+        '/home/beyza/ardupilot/ArduCopter/eeprom.bin',
+        '/home/beyza/eeprom.bin',
+        os.path.join(ws, 'eeprom.bin'),
+    ]:
+        try:
+            os.remove(ep)
+        except Exception:
+            pass
+
+    # DDS shared memory temizliği — eski launch'lardan kalan SHM kilitlerini kaldır
+    import glob as _glob
+    for shm in _glob.glob('/dev/shm/fastrtps_*') + _glob.glob('/dev/shm/Fast_*'):
+        try:
+            os.remove(shm)
+        except Exception:
+            pass
+
     # ROS2 loopback (DDS: sadece localhost arasında haberleşe)
+    fastdds_profile = os.path.join(pkg_dir, 'config/fastdds_no_shm.xml')
     env = {
         'ROS_LOCALHOST_ONLY': '1',
-        'CYCLONEDDS_URI': 'file://' + os.path.expanduser(
-            '~/gz_ws/src/my_swarm_pkg/config/cyclonedds_localhost.xml'
-        ),
+        'FASTRTPS_DEFAULT_PROFILES_FILE': fastdds_profile,
+        'CYCLONEDDS_URI': 'file://' + os.path.join(pkg_dir, 'config/cyclonedds_localhost.xml'),
         'GZ_SIM_RESOURCE_PATH': ':'.join([
-            os.path.expanduser('~/gz_ws/src/my_swarm_pkg/models'),
-            os.path.expanduser('~/gz_ws/src/ardupilot_gazebo/models'),
-            os.path.expanduser('~/gz_ws/install/ardupilot_gazebo/share/ardupilot_gazebo/models'),
+            os.path.join(pkg_dir, 'models'),
+            os.path.join(ws, 'src/ardupilot_gazebo/models'),
+            os.path.join(ws, 'install/ardupilot_gazebo/share/ardupilot_gazebo/models'),
             os.path.expanduser('~/ardupilot_gazebo/models'),
+            os.path.expanduser('~/new_repo_local/gz_ws/src/ardupilot_gazebo/models'),
+            os.path.expanduser('~/new_repo_local/gz_ws/install/ardupilot_gazebo/share/ardupilot_gazebo/models'),
             '/usr/share/gz/gz-sim8/models',
         ]),
         'GZ_SIM_SYSTEM_PLUGIN_PATH': os.path.expanduser('~/ardupilot_gazebo/build'),
     }
-
-    ws = os.path.expanduser('~/gz_ws')
-    pkg_dir = os.path.join(ws, 'src/my_swarm_pkg')
 
     args = []
 
@@ -186,7 +213,7 @@ def generate_launch_description():
         # Timer: SITL'ler sırayla başlasın (boğulma önleme)
         sitl_procs.append(
             TimerAction(
-                period=idx * 2.0,  # drone1: 0s, drone2: 2s, drone3: 4s
+                period=5.0 + idx * 2.0,  # Gazebo'nun yüklenmesi için 5s bekle. drone1: 5s, drone2: 7s, drone3: 9s
                 actions=[
                     ExecuteProcess(
                         cmd=[
@@ -198,7 +225,8 @@ def generate_launch_description():
                             '--slave', '0',
                             '--defaults',
                             os.path.expanduser(
-                                '~/ardupilot/Tools/autotest/default_params/copter.parm'),
+                                '~/ardupilot/Tools/autotest/default_params/copter.parm')
+                            + ',' + os.path.join(pkg_dir, 'config/sitl_sr0.parm'),
                             '--sim-address=127.0.0.1',
                             '--home', f'-35.363262,149.165237,584.0,0.0',
                             # SERIAL0 → MAVROS UDP
@@ -520,6 +548,7 @@ def generate_launch_description():
                         f'export GZ_SIM_RESOURCE_PATH={env["GZ_SIM_RESOURCE_PATH"]} && '
                         f'export GZ_SIM_SYSTEM_PLUGIN_PATH={env["GZ_SIM_SYSTEM_PLUGIN_PATH"]} && '
                         f'export ROS_LOCALHOST_ONLY=1 && '
+                        f'export FASTRTPS_DEFAULT_PROFILES_FILE={fastdds_profile} && '
                         f'export CYCLONEDDS_URI={env["CYCLONEDDS_URI"]} && '
                         f'ros2 run my_swarm_pkg mission_fsm'
                     ],
@@ -531,6 +560,25 @@ def generate_launch_description():
     )
 
     args.extend(gcs_nodes)
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # 6️⃣ LOCAL_POSITION_NED STREAM AKTİFLEŞTİR
+    #    25s sonra MAVROS cmd/command servisiyle ArduPilot'a
+    #    MAV_CMD_SET_MESSAGE_INTERVAL (511) gönderir → local_position/pose çalışır
+    # ═══════════════════════════════════════════════════════════════════════
+    stream_script = os.path.join(pkg_dir, 'config/activate_streams.py')
+    args.append(
+        TimerAction(
+            period=60.0,
+            actions=[
+                ExecuteProcess(
+                    cmd=['python3', stream_script],
+                    output='screen',
+                    additional_env=env,
+                )
+            ]
+        )
+    )
 
     # ═══════════════════════════════════════════════════════════════════════
     # KAPANIŞ BANNER

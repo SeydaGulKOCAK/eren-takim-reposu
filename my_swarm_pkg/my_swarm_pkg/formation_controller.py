@@ -170,7 +170,7 @@ _DEFAULT_FORMATION = 'OKBASI'
 # ZAMAN AYIMI VE LİMİT SABİTLERİ
 # ══════════════════════════════════════════════════════════════════════════════
 
-INTENT_TIMEOUT_S         = 1.5    # Bu süre intent gelmezse setpointi dondur
+INTENT_TIMEOUT_S         = 3.0    # Bu süre intent gelmezse setpointi dondur (2Hz×3s=6 paket marjı)
 SETPOINT_HZ              = 50.0   # ArduPilot setpoint hızı
 NORMAL_SP_CHANGE_M       = 0.10   # Normal slew rate  (50Hz×0.10 = 5 m/s max)
 DAMPENED_SP_CHANGE_M     = 0.02   # Osilasyon dampening slew rate (1 m/s max)
@@ -535,8 +535,16 @@ class FormationController(Node):
         else:
             formation = intent.formation_type
             spacing   = intent.drone_spacing
-            yaw       = intent.target_yaw
             cz        = intent.drone_altitude
+            # [v3 ROT+MOVE] Yaw'ı sanal lider → hedef yönünden dinamik hesapla
+            # → formasyon hareket ederken aynı anda döner (ayrı faz yok)
+            _tx = intent.target_pos.x - cx
+            _ty = intent.target_pos.y - cy
+            _d2 = math.sqrt(_tx * _tx + _ty * _ty)
+            if _d2 > ARRIVAL_RADIUS_M:
+                yaw = math.atan2(_ty, _tx)
+            else:
+                yaw = intent.target_yaw  # Hedefe ulaştı → sabit yaw
 
         if formation not in FORMATION_OFFSETS:
             self.get_logger().warn(
@@ -641,19 +649,28 @@ class FormationController(Node):
 
     def _get_physical_centroid(self) -> tuple[float, float, float]:
         """
-        FLYING drone'ların GERÇEK POZİSYON ortalamasını hesapla.
+        FLYING/IDLE drone'ların GERÇEK POZİSYON ortalamasını hesapla.
 
         Birincil : /drone{i}/pose verilerinin ENU ortalaması
-        Fallback : intent.target_pos (pose verisi yok veya stale ise)
+        Fallback : Kendi son bilinen pozisyon (intent.target_pos DEĞİL!)
 
         KULLANIM: Sadece sanal lider ilk başlatmasında ve teleop init'te.
         NAVİGASYON için → _get_virtual_centroid() kullanılır (v3).
+
+        NOT: IDLE drone'lar da dahil edilir çünkü FLYING'e geçiş anında
+        formation_controller henüz diğer drone'ların FLYING durumunu
+        almamış olabilir. Bu, VL'nin yanlış (50m uzakta) başlatılmasını önler.
         """
         now = time.time()
         valid: list[tuple[float, float, float]] = []
 
+        # FLYING/REJOIN + IDLE drone'ları dahil et (STANDBY/diğerleri hariç)
+        CENTROID_STATES = frozenset({
+            DroneState.FLYING, DroneState.REJOIN, DroneState.IDLE
+        })
+
         for did in range(1, self.num_drones + 1):
-            if self._drone_states.get(did) not in DroneState.ACTIVE_STATES:
+            if self._drone_states.get(did) not in CENTROID_STATES:
                 continue
             pose = self._drone_poses.get(did)
             if pose is None:
@@ -667,10 +684,16 @@ class FormationController(Node):
             ))
 
         if not valid:
-            # Fallback: intent.target_pos
-            if self._latest_intent is not None:
-                tp = self._latest_intent.target_pos
-                return (tp.x, tp.y, self._latest_intent.drone_altitude)
+            # Fallback: kendi son bilinen pozisyon (pose stale veya henüz gelmedi)
+            # intent.target_pos'a DÖNME! Bu VL'nin hedefte başlamasına yol açar.
+            own_pose = self._drone_poses.get(self.drone_id)
+            if own_pose is not None:
+                alt = self._latest_intent.drone_altitude if self._latest_intent else 5.0
+                return (
+                    own_pose.pose.position.x,
+                    own_pose.pose.position.y,
+                    alt,
+                )
             return (0.0, 0.0, 5.0)
 
         cx = sum(p[0] for p in valid) / len(valid)

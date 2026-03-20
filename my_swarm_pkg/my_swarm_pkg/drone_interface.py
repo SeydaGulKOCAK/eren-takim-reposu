@@ -39,6 +39,10 @@ KOORDİNAT SİSTEMİ:
   §5.5.4 Kill-switch   → GUIDED dışı mod = pilot_override=True ✅
 """
 
+import struct
+import threading
+
+import serial
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
@@ -65,8 +69,12 @@ class DroneInterface(Node):
         # ══════════════════════════════════════════════════════
         self.declare_parameter('drone_id', 1)
         self.declare_parameter('takeoff_altitude', 10.0)
+        self.declare_parameter('uwb_enabled', False)
+        self.declare_parameter('uwb_port', '/dev/ttyUSB1')
         self.drone_id = self.get_parameter('drone_id').value
         self.takeoff_altitude = self.get_parameter('takeoff_altitude').value
+        self._uwb_enabled = self.get_parameter('uwb_enabled').value
+        self._uwb_port    = self.get_parameter('uwb_port').value
 
         # Topic prefix oluştur: drone_id=2 → ns='drone2'
         self.ns = f'drone{self.drone_id}'
@@ -86,6 +94,7 @@ class DroneInterface(Node):
         self.last_mode = ''            # Son gönderilen mod (tekrar engeli)
         self.pilot_override_active = False  # RC kill-switch aktif mi?
         self._arm_pending = False      # ARM komutu GUIDED onayı bekliyor
+        self._arm_in_progress = False  # arm() çağrısı devam ediyor (disarm false-trigger koruması)
         self._current_altitude = 0.0   # MAVROS ENU z (metre) - yükseklik kapısı için
         # State-triggered yayın için: son yayınlanan değeri sakla.
         # Böylece sadece değişince yayınlarız, gereksiz Wi-Fi trafiği önlenir.
@@ -222,6 +231,17 @@ class DroneInterface(Node):
             10
         )
 
+        # UWB konumunu ArduPilot EKF'ye besle (GPS yerine kullanır)
+        # Gerekli ArduPilot parametreleri:
+        #   EK3_SRC1_POSXY = 6  (ExtNav)
+        #   EK3_SRC1_VELXY = 6  (ExtNav)
+        #   VISO_TYPE      = 1  (Aktif)
+        self._uwb_pose_pub = self.create_publisher(
+            PoseStamped,
+            f'{self.mavros_ns}/vision_pose/pose',
+            10
+        )
+
         # ══════════════════════════════════════════════════════
         # SERVİS İSTEMCİLERİ
         # Topic'lerden farklı: istek-cevap mantığı
@@ -261,6 +281,14 @@ class DroneInterface(Node):
         # ══════════════════════════════════════════════════════
         self.create_timer(5.0, self._heartbeat_pilot_override)
 
+        # UWB thread'ini başlat (sadece uwb_enabled=True ise)
+        if self._uwb_enabled:
+            t = threading.Thread(target=self._uwb_reader_thread, daemon=True)
+            t.start()
+            self.get_logger().info(
+                f'📡 [{self.ns}] UWB (Nooploop LinkTrack P-A) başlatıldı: {self._uwb_port}'
+            )
+
         self.get_logger().info(
             f'✅ [{self.ns}] drone_interface HAZIR! Topic\'ler dinleniyor...'
         )
@@ -293,7 +321,9 @@ class DroneInterface(Node):
         → intent_coordinator bu drone'u FLYING listesinden çıkarır
         → "Drone düştü!" yanlış alarmı engellenir (Şartname §5.5.4)
         """
-        prev_mode = self.current_state.mode
+        prev_connected = self.current_state.connected
+        prev_mode  = self.current_state.mode
+        prev_armed = self.current_state.armed
         self.current_state = msg
 
         # Mod değiştiyse logla
@@ -301,6 +331,31 @@ class DroneInterface(Node):
             self.get_logger().info(
                 f'🔄 [{self.ns}] Mod: {prev_mode or "?"} → {msg.mode}'
             )
+
+        # MAVROS yeni bağlandıysa ve bekleyen bir mod komutu varsa yeniden gönder
+        # (drone3 gibi geç bağlanan durumlarda retry'lar bitmeden önce bağlantı gelmez)
+        if not prev_connected and msg.connected and self.last_mode:
+            self.get_logger().info(
+                f'🔌 [{self.ns}] MAVROS yeni bağlandı → {self.last_mode} komutu yeniden gönderiliyor'
+            )
+            self._send_mode_with_retry(self.last_mode, retries_left=30)
+
+        # Beklenmedik DISARM tespiti (motor arızası / çökme)
+        # Önceden ARM'lıydı, şimdi değil ve biz ne ARM ne DISARM komutu vermedik
+        if prev_armed and not msg.armed and not self._arm_pending and not self._arm_in_progress:
+            if msg.mode == 'GUIDED':
+                # GUIDED modda DISARM → ArduCopter auto-disarm (takeoff gecikmesi)
+                # Pilot override değil — otomatik re-ARM dene
+                self.get_logger().warn(
+                    f'⚡ [{self.ns}] GUIDED auto-disarm! Re-ARM deneniyor...'
+                )
+                self.create_timer(2.0, lambda: self.arm(value=True))
+            else:
+                self.get_logger().warn(
+                    f'💥 [{self.ns}] Beklenmedik DISARM! Motor arızası veya çökme.'
+                )
+                self.pilot_override_active = True
+                self._publish_pilot_override_state()
 
         # Otonom sistem tarafından kullanılan izinli modlar (whitelist).
         # BRAKE : ArduPilot acil frenleme modu → sistemimiz tetikleyebilir
@@ -355,8 +410,9 @@ class DroneInterface(Node):
           ArduPilot GUIDED_TAKEOFF → GUIDED_POSITION geçişi yapar ve kalkış iptal olur!
           Bu yüzden drone yere yakınken (< 0.5m) setpoint iletmiyoruz.
           Drone 0.5m üzerine çıkınca (kalkış tamamlandı) formation_controller devralır.
+
         """
-        if self._current_altitude < 0.5:
+        if self._current_altitude < (self.takeoff_altitude - 1.0):
             return  # Kalkış tamamlanmadı, setpoint gönderme (TAKEOFF iptal olmasın)
         self.mavros_setpoint_pub.publish(msg)
 
@@ -379,10 +435,10 @@ class DroneInterface(Node):
             f'🧭 [{self.ns}] Mod komutu: {msg.data}'
         )
         self.last_mode = msg.data
-        self._send_mode_with_retry(msg.data, retries_left=10)
+        self._send_mode_with_retry(msg.data, retries_left=30)
 
-    def _send_mode_with_retry(self, mode: str, retries_left: int = 10):
-        """set_mode servisi hazır değilse 2sn sonra tekrar dene (en fazla 10 kez)."""
+    def _send_mode_with_retry(self, mode: str, retries_left: int = 30):
+        """set_mode servisi hazır değilse veya Pixhawk reddederse 2sn sonra tekrar dene (en fazla 30 kez)."""
         if self.set_mode_client.service_is_ready():
             req = SetMode.Request()
             req.custom_mode = mode
@@ -397,11 +453,23 @@ class DroneInterface(Node):
                             f'✅ [{self.ns}] Mod değişti: {mode}'
                         )
                     else:
-                        self.last_mode = ''
-                        self.get_logger().error(
-                            f'❌ [{self.ns}] Pixhawk modu reddetti: '
-                            f'{mode} → GPS/batarya/sensör sorunu olabilir!'
+                        self.get_logger().warn(
+                            f'⚠️  [{self.ns}] Pixhawk modu reddetti: {mode} '
+                            f'(EKF hazır değil?), {retries_left}s sonra tekrar → kalan: {retries_left}'
                         )
+                        if retries_left > 0:
+                            _t = [None]
+
+                            def _retry_mode():
+                                _t[0].cancel()
+                                self._send_mode_with_retry(mode, retries_left - 1)
+
+                            _t[0] = self.create_timer(2.0, _retry_mode)
+                        else:
+                            self.last_mode = ''
+                            self.get_logger().error(
+                                f'❌ [{self.ns}] Pixhawk {mode} modunu 60sn içinde kabul etmedi!'
+                            )
                 except Exception as e:
                     self.last_mode = ''
                     self.get_logger().error(
@@ -516,6 +584,8 @@ class DroneInterface(Node):
             self.get_logger().info(
                 f'🔐 [{self.ns}] {action} komutu gönderiliyor...'
             )
+            if value:
+                self._arm_in_progress = True  # DISARM false-trigger koruması
             future = self.arming_client.call_async(req)
 
             # Pixhawk ARM/DISARM isteğini kabul etti mi?
@@ -528,13 +598,16 @@ class DroneInterface(Node):
                             f'✅ [{self.ns}] {action} başarılı!'
                         )
                         if value:
+                            self._arm_in_progress = False
                             self.takeoff()
                     else:
                         self.get_logger().warn(
                             f'⚠️  [{self.ns}] Normal ARM reddedildi, force ARM deneniyor...'
                         )
+                        self._arm_in_progress = False
                         self._force_arm(value)
                 except Exception as e:
+                    self._arm_in_progress = False
                     self.get_logger().error(
                         f'❌ [{self.ns}] arming servis hatası: {e}'
                     )
@@ -561,7 +634,15 @@ class DroneInterface(Node):
                     if value:
                         self.takeoff()
                 else:
-                    self.get_logger().error(f'❌ [{self.ns}] Force ARM da başarısız!')
+                    self.get_logger().warn(
+                        f'⚠️  [{self.ns}] Force ARM başarısız (EKF hazır değil?), '
+                        f'10sn sonra tekrar denenecek...'
+                    )
+                    _t = [None]
+                    def _retry_arm():
+                        _t[0].cancel()
+                        self._force_arm(value)
+                    _t[0] = self.create_timer(10.0, _retry_arm)
             except Exception as e:
                 self.get_logger().error(f'❌ [{self.ns}] Force ARM hatası: {e}')
 
@@ -621,6 +702,102 @@ class DroneInterface(Node):
                 )
 
         future.add_done_callback(_on_takeoff_done)
+
+
+    # ══════════════════════════════════════════════════════════════════════
+    # UWB — NOOPLOOP LINKTRACK P-A (GPS-DENIED KONUMLAMA)
+    # ══════════════════════════════════════════════════════════════════════
+    #
+    # Nooploop Nodeframe0 binary protokolü (32 bayt sabit uzunluk):
+    #   [0]     0x55        Başlık
+    #   [1]     0x00        Fonksiyon işareti (nodeframe0)
+    #   [2]     0x20        Çerçeve uzunluğu (32)
+    #   [3]     role        0=tag, 1=anchor
+    #   [4]     id          Node kimliği
+    #   [5-6]   sys_time    Sistem zamanı (ms, uint16 LE)
+    #   [7-10]  pos_x       ENU X (metre, float32 LE)
+    #   [11-14] pos_y       ENU Y (metre, float32 LE)
+    #   [15-18] pos_z       ENU Z (metre, float32 LE)
+    #   [19-22] vel_x       Hız X (m/s, float32 LE)
+    #   [23-26] vel_y       Hız Y (m/s, float32 LE)
+    #   [27-30] vel_z       Hız Z (m/s, float32 LE)
+    #   [31]    checksum    Bayt toplamı mod 256
+    #
+    _NLINK_HEADER1    = 0x55
+    _NLINK_NODEFRAME0 = 0x00
+    _NLINK_FRAME_LEN  = 32
+
+    def _uwb_reader_thread(self):
+        """
+        Nooploop seri port okuyucu — arka planda çalışır, ROS2 spin'i bloklamaz.
+        Bağlantı kesilirse 2 saniye bekleyip otomatik yeniden bağlanır.
+        """
+        import time
+        while rclpy.ok():
+            try:
+                ser = serial.Serial(self._uwb_port, baudrate=921600, timeout=1.0)
+                self.get_logger().info(
+                    f'✅ [{self.ns}] UWB seri port açıldı: {self._uwb_port}'
+                )
+                buf = bytearray()
+                while rclpy.ok():
+                    chunk = ser.read(64)
+                    if not chunk:
+                        continue
+                    buf.extend(chunk)
+                    # Tampon içinde tam çerçeve ara
+                    while len(buf) >= self._NLINK_FRAME_LEN:
+                        idx = buf.find(self._NLINK_HEADER1)
+                        if idx == -1:
+                            buf.clear()
+                            break
+                        if idx > 0:
+                            del buf[:idx]   # Başlığa kadar çöp temizle
+                        if len(buf) < self._NLINK_FRAME_LEN:
+                            break           # Tam çerçeve henüz gelmedi
+                        frame = bytes(buf[:self._NLINK_FRAME_LEN])
+                        # Checksum doğrula: ilk 31 baytın toplamı mod 256
+                        if sum(frame[:-1]) & 0xFF != frame[-1]:
+                            del buf[:1]     # Yanlış çerçeve, 1 bayt at ve tekrar dene
+                            continue
+                        if frame[1] == self._NLINK_NODEFRAME0:
+                            self._parse_nlink_nodeframe0(frame)
+                        del buf[:self._NLINK_FRAME_LEN]
+            except serial.SerialException as e:
+                self.get_logger().warn(
+                    f'⚠️  [{self.ns}] UWB seri port hatası: {e} — 2sn sonra tekrar denenecek'
+                )
+                time.sleep(2.0)
+            except Exception as e:
+                self.get_logger().error(f'❌ [{self.ns}] UWB okuma hatası: {e}')
+                time.sleep(2.0)
+
+    def _parse_nlink_nodeframe0(self, frame: bytes):
+        """
+        Nodeframe0 çerçevesini ayrıştır.
+        Sürü ortamında birden fazla drone'un verisi aynı UWB ağından geçebilir;
+        bu yüzden sadece kendi drone_id'mize ait paketi işliyoruz.
+        """
+        node_id = frame[4]
+        if node_id != self.drone_id:
+            return  # Başka drone'a ait paket, atla
+
+        pos_x = struct.unpack_from('<f', frame, 7)[0]   # ENU X (metre)
+        pos_y = struct.unpack_from('<f', frame, 11)[0]  # ENU Y (metre)
+        pos_z = struct.unpack_from('<f', frame, 15)[0]  # ENU Z (metre)
+
+        # Geçersiz değerleri filtrele (NaN, Inf, makul alan dışı)
+        if not all(-1000.0 < v < 1000.0 for v in (pos_x, pos_y, pos_z)):
+            return
+
+        msg = PoseStamped()
+        msg.header.stamp    = self.get_clock().now().to_msg()
+        msg.header.frame_id = 'map'
+        msg.pose.position.x = pos_x
+        msg.pose.position.y = pos_y
+        msg.pose.position.z = pos_z
+        msg.pose.orientation.w = 1.0   # Yaw bilinmiyor → nötr quaternion
+        self._uwb_pose_pub.publish(msg)
 
 
 # ══════════════════════════════════════════════════════════════════════════
