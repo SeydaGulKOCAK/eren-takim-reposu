@@ -102,7 +102,7 @@ CTRL_DT: float = 1.0 / CTRL_HZ
 
 # Osilasyon tespiti
 OSC_WINDOW: int = 20         # Son kaç adıma bak (0.4s @ 50Hz)
-OSC_THRESH_M: float = 0.08   # [m] — setpoint std sapması eşiği
+OSC_THRESH_M: float = 2.00   # [m] — setpoint std sapması eşiği
 OSC_COOLDOWN_S: float = 5.0  # [s] — aynı drone'dan iki event arası min bekleme
 
 # Setpoint geçerliliği
@@ -448,6 +448,9 @@ class CollisionAvoidanceNode(Node):
         """
         self._sp_hist_x.append(sp[0])
         self._sp_hist_y.append(sp[1])
+
+        if self._own_pose[2] < 3.0:
+            return  # Kalkış tamamlanmadı, osilasyon kontrolü yapma
 
         if len(self._sp_hist_x) < OSC_WINDOW:
             return  # Yeterli veri yok

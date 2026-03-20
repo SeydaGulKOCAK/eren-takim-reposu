@@ -14,7 +14,7 @@ setup(
         ('share/' + package_name + '/launch', glob('launch/*.launch.py')),
         ('share/' + package_name + '/config', glob('config/*')),
     ],
-    install_requires=['setuptools'],
+    install_requires=['setuptools', 'pyserial'],
     zip_safe=True,
     entry_points={
         'console_scripts': [
@@ -28,6 +28,7 @@ setup(
             'waypoint_navigator = my_swarm_pkg.waypoint_navigator:main',
             'mission_fsm = my_swarm_pkg.mission_fsm:main',
             'precision_landing = my_swarm_pkg.precision_landing:main',
+            'color_zone_detector = my_swarm_pkg.color_zone_detector:main',
         ],
     },
 )
