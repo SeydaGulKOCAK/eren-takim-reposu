@@ -102,7 +102,7 @@ CTRL_DT: float = 1.0 / CTRL_HZ
 
 # Osilasyon tespiti
 OSC_WINDOW: int = 20         # Son kaç adıma bak (0.4s @ 50Hz)
-OSC_THRESH_M: float = 2.00   # [m] — setpoint std sapması eşiği
+OSC_THRESH_M: float = 0.08   # [m] — setpoint std sapması eşiği
 OSC_COOLDOWN_S: float = 5.0  # [s] — aynı drone'dan iki event arası min bekleme
 
 # Setpoint geçerliliği
