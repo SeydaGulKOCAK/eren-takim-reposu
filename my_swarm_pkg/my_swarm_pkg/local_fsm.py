@@ -399,6 +399,13 @@ class LocalFSM(Node):
             # drone_id=0 → broadcast (tüm drone'ları etkiler)
             return
 
+        # OSCILLATION → SAFETY_HOLD tetikleme: formation_controller dampening yeterli
+        if msg.event_type == 'OSCILLATION':
+            self.get_logger().info(
+                f'[{self.ns}] ℹ️  OSCILLATION eventi yoksayıldı — formation_controller dampening aktif.'
+            )
+            return
+
         self.get_logger().warn(
             f'🚨 [{self.ns}] GÜVENLİK OLAYI! Tip: {msg.event_type} '
             f'| Açıklama: {msg.description}\n'

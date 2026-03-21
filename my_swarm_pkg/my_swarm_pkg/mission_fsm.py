@@ -219,9 +219,9 @@ class MissionFSMNode(Node):
             String, '/swarm/gcs_heartbeat', 10
         )
         self._altitude_pub = self.create_publisher(
-            Float64, '/gcs/drone_altitude', reliable_qos
+            Float64, '/gcs/drone_altitude', best_effort_qos
         )
-        self._gcs_altitude: float = 10.0   # Jüri'nin belirteceği uçuş irtifası [m]
+        self._gcs_altitude: float = 8.0   # Jüri'nin belirteceği uçuş irtifası [m]
 
         # ── QR MAP SETUP (JÜRİ KOORDİNATI) ────────────────────────────
         self._set_qr_map_client = self.create_client(SetQRMap, '/swarm/set_qr_map')

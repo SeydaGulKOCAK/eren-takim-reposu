@@ -399,7 +399,17 @@ class QRPerception(Node):
 
         # Gri tonlama — pyzbar daha hızlı/güvenilir çalışır
         gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
-        decoded_list = pyzbar.decode(gray)
+
+        # Kontrast artır (CLAHE) — Gazebo render gölge/parlaklık sorunlarını giderir
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        gray = clahe.apply(gray)
+        # 4x upscale — 15m yüksekten QR ~45px → 180px, pyzbar için yeterli
+        h, w = gray.shape
+        gray_up = cv2.resize(gray, (w * 4, h * 4), interpolation=cv2.INTER_CUBIC)
+
+        decoded_list = pyzbar.decode(gray_up)
+        if not decoded_list:
+            decoded_list = pyzbar.decode(gray)
 
         for obj in decoded_list:
             # JSON parse
@@ -460,13 +470,26 @@ class QRPerception(Node):
     # ── QR YAKIŞLIK KONTROLÜ (10 Hz) ────────────────────────────────────
 
     def _check_qr_proximity(self):
-        """Kamera drone'u QR'a yeterince yaklaştı mı? → QRResult yayınla."""
-        cam_pose = self._drone_poses.get(self._camera_drone_id)
-        if cam_pose is None:
-            return
-
-        cx = cam_pose.pose.position.x
-        cy = cam_pose.pose.position.y
+        """Sürü centroidi QR'a yeterince yaklaştı mı? → QRResult yayınla."""
+        # OKBASI formasyonunda kamera drone (drone3) centroid'in ~2.5m arkasında.
+        # Waypoint navigator 5m'de loiter başlatınca kamera drone ~7m uzakta kalır.
+        # Bu yüzden centroid konumu kullanılır — loiter başlayınca hemen tetikler.
+        flying_poses = [
+            p for i, p in self._drone_poses.items()
+            if p is not None and self._drone_states.get(i, '') in (
+                'FLYING', 'DETACH', 'REJOIN', 'LAND_ZONE', 'RETURN_HOME'
+            )
+        ]
+        if flying_poses:
+            cx = sum(p.pose.position.x for p in flying_poses) / len(flying_poses)
+            cy = sum(p.pose.position.y for p in flying_poses) / len(flying_poses)
+        else:
+            # Fallback: kamera drone
+            cam_pose = self._drone_poses.get(self._camera_drone_id)
+            if cam_pose is None:
+                return
+            cx = cam_pose.pose.position.x
+            cy = cam_pose.pose.position.y
 
         for qr_id, qr_data in self._qr_nodes.items():
             if qr_id in self._read_qr_ids:
@@ -531,7 +554,7 @@ class QRPerception(Node):
         # Formasyon
         msg.formation_active = bool(frm.get('aktif', False))
         msg.formation_type   = str(frm.get('tip',   'OKBASI'))
-        msg.drone_spacing    = 6.0   # sabit — şartname §5.2.1
+        msg.drone_spacing    = 5.0   # sabit — şartname §5.2.1 (intent_coordinator default ile tutarlı)
 
         # İrtifa
         msg.altitude_active  = bool(irtifa.get('aktif', False))
