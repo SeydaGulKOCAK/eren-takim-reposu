@@ -213,7 +213,7 @@ def generate_launch_description():
         # Timer: SITL'ler sırayla başlasın (boğulma önleme)
         sitl_procs.append(
             TimerAction(
-                period=5.0 + idx * 2.0,  # Gazebo'nun yüklenmesi için 5s bekle. drone1: 5s, drone2: 7s, drone3: 9s
+                period=20.0 + idx * 2.0,  # Gazebo'nun yüklenmesi için 20s bekle. drone1: 20s, drone2: 22s, drone3: 24s
                 actions=[
                     ExecuteProcess(
                         cmd=[

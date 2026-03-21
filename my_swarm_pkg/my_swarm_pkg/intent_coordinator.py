@@ -146,7 +146,7 @@ class IntentCoordinator(Node):
     #   local_fsm publish_rate = 100ms
     #   Güvenli margin = timeout / publish_rate = 600/100 = 6 paket
     #   → 6 paketten az kayıp → FALSE ALARM yok
-    HEARTBEAT_TIMEOUT_MS: float = 600.0
+    HEARTBEAT_TIMEOUT_MS: float = 1200.0
 
     def __init__(self):
         super().__init__('intent_coordinator')
