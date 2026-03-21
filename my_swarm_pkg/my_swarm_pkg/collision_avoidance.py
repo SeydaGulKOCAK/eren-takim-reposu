@@ -90,7 +90,7 @@ from swarm_msgs.msg import LocalState, SwarmIntent, SafetyEvent
 # ══════════════════════════════════════════════════════════════════════════════
 # APF PARAMETRELERİ — tüm değerler simülasyon testi sonucu kalibre edilmiştir
 # ══════════════════════════════════════════════════════════════════════════════
-R_MAX: float = 8.0    # [m] — itici kuvvetin etki alanı başlangıcı
+R_MAX: float = 4.5    # [m] — itici kuvvetin etki alanı başlangıcı (5m spacing altında devreye girer)
 R_MIN: float = 3.0    # [m] — tehlike bölgesi (tam amplify kuvvet)
 K_REP: float = 18.0   # [—] — itici potansiyel kazanç katsayısı
 MAX_CORR_M: float = 3.0   # [m] — APF düzeltme vektörünün clip sınırı (güvenlik)
@@ -102,7 +102,7 @@ CTRL_DT: float = 1.0 / CTRL_HZ
 
 # Osilasyon tespiti
 OSC_WINDOW: int = 20         # Son kaç adıma bak (0.4s @ 50Hz)
-OSC_THRESH_M: float = 0.08   # [m] — setpoint std sapması eşiği
+OSC_THRESH_M: float = 4.00   # [m] — setpoint std sapması eşiği (2m → 4m: formasyon hareketi false positive önleme)
 OSC_COOLDOWN_S: float = 5.0  # [s] — aynı drone'dan iki event arası min bekleme
 
 # Setpoint geçerliliği
@@ -421,11 +421,11 @@ class CollisionAvoidanceNode(Node):
             if uid == self._detach_drone_id and self._detach_drone_id != 0:
                 magnitude *= 0.5
 
-            # ── Yön: komşudan bize (uzaklaşma yönü) ─────────────────────────
+            # ── Yön: komşudan bize (sadece XY — irtifa şartname gereği sabit) ─
             away = _unit_vec(npos, own_pos)  # komşudan bize doğru
             fx += magnitude * away[0]
             fy += magnitude * away[1]
-            fz += magnitude * away[2]
+            # fz: kasıtlı sıfır — tüm dronlar aynı irtifada uçar
 
         # İstatistik güncelle
         self._dbg_closest_dist = closest_dist
@@ -540,7 +540,7 @@ class CollisionAvoidanceNode(Node):
         sp_final: tuple[float, float, float] = (
             sp_raw[0] + corr[0],
             sp_raw[1] + corr[1],
-            sp_raw[2] + corr[2],  # Z düzeltmesi: irtifa çakışması için
+            sp_raw[2],  # Z sabit: tüm dronlar aynı irtifada (şartname gereği)
         )
 
         # ── 6) Osilasyon tespiti ──────────────────────────────────────────────

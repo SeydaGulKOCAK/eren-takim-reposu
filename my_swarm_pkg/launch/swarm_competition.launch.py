@@ -75,9 +75,9 @@ def generate_launch_description():
     # mavros_udp_port: MAVROS bağlantısı (udpclient → MAVROS dinliyor)
     # mp_udp_port    : Mission Planner bağlantısı (udpclient → MP dinliyor)
     DRONE_CONFIGS = [
-        ('drone1', 1, 14550, 14551, 0.0,  0.0, 0.0),
-        ('drone2', 2, 14560, 14561, 4.0,  0.0, 0.0),
-        ('drone3', 3, 14570, 14571, 8.0,  0.0, 0.0),
+        ('drone1', 1, 14550, 14551, 7.33,  0.0,  0.0),
+        ('drone2', 2, 14560, 14561, 2.33, -2.5,  0.0),
+        ('drone3', 3, 14570, 14571, 2.33,  2.5,  0.0),
     ]
 
     # ── GEOFENCİNG PARAMETRE (Güvenlik) ───────────────────────────────────
@@ -268,11 +268,9 @@ def generate_launch_description():
                         executable='mavros_node',
                         namespace=f'{ns}/mavros',
                         parameters=[{
-                            # SITL udpclient olarak 14550'e gönderiyor
-                            # MAVROS o porta dinliyor: udp://:14550@
                             'fcu_url': f'udp://:{mavros_port}@',
                             'tgt_system': sysid,
-                        }],
+                        }, os.path.join(pkg_dir, 'config/mavros_config.yaml')],
                         output='log',
                         additional_env=env,
                     )
@@ -522,6 +520,27 @@ def generate_launch_description():
             ]
         )
     )
+
+    # ── ros_gz_image bridge — Gazebo kamera → ROS2 image_raw (OTR için gerekli) ──────
+    for drone_id in [1, 2, 3]:
+        per_drone_nodes.append(
+            TimerAction(
+                period=20.0,  # Sistem stabil olduktan sonra başlat
+                actions=[
+                    Node(
+                        package='ros_gz_image',
+                        executable='image_bridge',
+                        arguments=[f'/drone{drone_id}/camera/image'],
+                        remappings=[(
+                            f'/drone{drone_id}/camera/image',
+                            f'/drone{drone_id}/camera/image_raw'
+                        )],
+                        output='log',
+                        additional_env=dict(env),
+                    )
+                ]
+            )
+        )
 
     args.extend(per_drone_nodes)
 

@@ -146,7 +146,7 @@ class IntentCoordinator(Node):
     #   local_fsm publish_rate = 100ms
     #   Güvenli margin = timeout / publish_rate = 600/100 = 6 paket
     #   → 6 paketten az kayıp → FALSE ALARM yok
-    HEARTBEAT_TIMEOUT_MS: float = 1200.0
+    HEARTBEAT_TIMEOUT_MS: float = 60000.0
 
     def __init__(self):
         super().__init__('intent_coordinator')
@@ -236,7 +236,7 @@ class IntentCoordinator(Node):
         self._drone_spacing:   float = 5.0
         self._target_yaw:      float = 0.0
         self._target_pos:      Point = Point()
-        self._drone_altitude:  float = 10.0
+        self._drone_altitude:  float = 8.0
         self._detach_drone_id: int   = 0    # 0 = kimse ayrılmıyor
         self._zone_color:      str   = ''
         self._maneuver_active: bool  = False
@@ -378,8 +378,12 @@ class IntentCoordinator(Node):
           PILOT_OVERRIDE → Drone RC kontrolünde → sürüden çıkar
         """
         # ── SEQ FİLTRESİ ─────────────────────────────────────────────────
+        # SAFETY_HOLD'daki drone seq sıfırlamış olabilir → filreyi atla
         if msg.seq <= self._drone_hb_seq.get(source_id, 0):
-            return  # Eski veya tekrar eden mesaj → DROP
+            if self._drone_state.get(source_id) != DroneState.SAFETY_HOLD:
+                return  # Eski veya tekrar eden mesaj → DROP
+            # SAFETY_HOLD'daysa seq'i sıfırla ve devam et (kurtarma)
+            self._drone_hb_seq[source_id] = msg.seq - 1
 
         prev_state = self._drone_state.get(source_id, DroneState.STANDBY)
 
