@@ -39,6 +39,7 @@ KOORDİNAT SİSTEMİ:
   §5.5.4 Kill-switch   → GUIDED dışı mod = pilot_override=True ✅
 """
 
+import os
 import struct
 import threading
 
@@ -80,11 +81,17 @@ class DroneInterface(Node):
         self.ns = f'drone{self.drone_id}'
         self.mavros_ns = f'/{self.ns}/mavros'
 
+        # HOME offset: MAVROS local frame → global frame dönüşümü
+        # Launch dosyasından env var olarak gelir
+        self._home_x = float(os.environ.get('HOME_X', '0.0'))
+        self._home_y = float(os.environ.get('HOME_Y', '0.0'))
+
         self.get_logger().info(
             f'🔌 drone_interface başlatılıyor...\n'
             f'   Drone ID  : {self.drone_id}\n'
             f'   Topic ns  : /{self.ns}/\n'
-            f'   MAVROS ns : {self.mavros_ns}/'
+            f'   MAVROS ns : {self.mavros_ns}/\n'
+            f'   HOME offset: ({self._home_x}, {self._home_y})'
         )
 
         # ══════════════════════════════════════════════════════
@@ -300,9 +307,13 @@ class DroneInterface(Node):
     def _mavros_pose_cb(self, msg: PoseStamped):
         """
         Pixhawk'tan gelen konumu sisteme ilet.
-        MAVROS zaten NED→ENU dönüşümünü yapıyor, biz sadece iletiyoruz.
+        MAVROS local frame → global frame: HOME offset ekle.
+        Böylece tüm dronelar aynı koordinat sisteminde görünür.
         """
         self._current_altitude = msg.pose.position.z  # ENU: z = yukarı (metre)
+        # Local → Global: HOME offset ekle
+        msg.pose.position.x += self._home_x
+        msg.pose.position.y += self._home_y
         msg.header.frame_id = 'map'
         self.pose_pub.publish(msg)
 
@@ -414,6 +425,9 @@ class DroneInterface(Node):
         """
         if self._current_altitude < (self.takeoff_altitude - 1.0):
             return  # Kalkış tamamlanmadı, setpoint gönderme (TAKEOFF iptal olmasın)
+        # Global → Local: HOME offset çıkar (MAVROS local frame bekler)
+        msg.pose.position.x -= self._home_x
+        msg.pose.position.y -= self._home_y
         self.mavros_setpoint_pub.publish(msg)
 
     def _cmd_mode_cb(self, msg: String):

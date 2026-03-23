@@ -115,19 +115,20 @@
       <pose degrees="true">-29 545 0 0 0 363</pose>
     </include>
 
+    <!-- ZORLU SENARYO: Dronelar 2m arayla yan yana (jüri testi) -->
     <include>
       <uri>model://Drone1</uri>
-      <pose degrees="true">7.33 0 0.195 0 0 90</pose>
+      <pose degrees="true">0 0 0.195 0 0 90</pose>
     </include>
 
     <include>
       <uri>model://Drone2</uri>
-      <pose degrees="true">2.33 -2.5 0.195 0 0 90</pose>
+      <pose degrees="true">0 -2.0 0.195 0 0 90</pose>
     </include>
 
     <include>
       <uri>model://Drone3</uri>
-      <pose degrees="true">2.33 2.5 0.195 0 0 90</pose>
+      <pose degrees="true">0 2.0 0.195 0 0 90</pose>
     </include>
 
     <!-- QR Markers: 6 adet — merkez (35,0) etrafında R=15 altıgen dizilim

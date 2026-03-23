@@ -45,7 +45,9 @@ from launch.actions import (
     ExecuteProcess,
     TimerAction,
     LogInfo,
+    RegisterEventHandler,
 )
+from launch.event_handlers import OnProcessExit
 from launch_ros.actions import Node
 from launch.substitutions import LaunchConfiguration
 from launch.conditions import IfCondition
@@ -141,6 +143,19 @@ def generate_launch_description():
     args = []
 
     # ═══════════════════════════════════════════════════════════════════════
+    # 🛡️ KORUMA: Bir süreç çökerse sistemi KAPATMA, sadece logla
+    # ros2 launch varsayılan davranışı: bir süreç ölünce hepsini öldür
+    # Bu kural bunu engeller — Gazebo ve diğer süreçler ayakta kalır
+    # ═══════════════════════════════════════════════════════════════════════
+    args.append(
+        RegisterEventHandler(
+            OnProcessExit(
+                on_exit=[LogInfo(msg='⚠️ Bir süreç çıktı ama sistem devam ediyor...')]
+            )
+        )
+    )
+
+    # ═══════════════════════════════════════════════════════════════════════
     # 0️⃣ ÖNCE: Eski FastRTPS shm dosyalarını temizle (stale mesaj sorunu önleme)
     # ═══════════════════════════════════════════════════════════════════════
     args.append(
@@ -213,7 +228,7 @@ def generate_launch_description():
         # Timer: SITL'ler sırayla başlasın (boğulma önleme)
         sitl_procs.append(
             TimerAction(
-                period=20.0 + idx * 2.0,  # Gazebo'nun yüklenmesi için 20s bekle. drone1: 20s, drone2: 22s, drone3: 24s
+                period=10.0 + idx * 2.0,  # Gazebo yüklendikten sonra. drone1: 10s, drone2: 12s, drone3: 14s
                 actions=[
                     ExecuteProcess(
                         cmd=[
@@ -261,7 +276,7 @@ def generate_launch_description():
 
         mavros_nodes.append(
             TimerAction(
-                period=12.0 + (sysid - 1) * 2.0,  # SITL hazır olduktan sonra (drone1: 12s, drone2: 14s, drone3: 16s)
+                period=25.0 + (sysid - 1) * 2.0,  # SITL hazır olduktan sonra (drone1: 25s, drone2: 27s, drone3: 29s)
                 actions=[
                     Node(
                         package='mavros',
@@ -286,7 +301,7 @@ def generate_launch_description():
     per_drone_nodes = []
 
     for ns, sysid, mavros_port, mp_port, hx, hy, hz in DRONE_CONFIGS:
-        delay = 9.0 + (sysid - 1) * 0.5
+        delay = 40.0 + (sysid - 1) * 1.0
         
         env_vars = {
             'DRONE_NS': ns,
@@ -473,7 +488,7 @@ def generate_launch_description():
     )
     per_drone_nodes.append(
         TimerAction(
-            period=10.5,
+            period=45.0,
             actions=[
                 Node(
                     package='my_swarm_pkg',
@@ -499,7 +514,7 @@ def generate_launch_description():
     color_zone_env = dict(env)
     per_drone_nodes.append(
         TimerAction(
-            period=11.0,
+            period=46.0,
             actions=[
                 Node(
                     package='my_swarm_pkg',
@@ -521,26 +536,26 @@ def generate_launch_description():
         )
     )
 
-    # ── ros_gz_image bridge — Gazebo kamera → ROS2 image_raw (OTR için gerekli) ──────
-    for drone_id in [1, 2, 3]:
-        per_drone_nodes.append(
-            TimerAction(
-                period=20.0,  # Sistem stabil olduktan sonra başlat
-                actions=[
-                    Node(
-                        package='ros_gz_image',
-                        executable='image_bridge',
-                        arguments=[f'/drone{drone_id}/camera/image'],
-                        remappings=[(
-                            f'/drone{drone_id}/camera/image',
-                            f'/drone{drone_id}/camera/image_raw'
-                        )],
-                        output='log',
-                        additional_env=dict(env),
-                    )
-                ]
-            )
-        )
+    # ros_gz_image bridge devre dışı — paket kurulu değil, formasyon testi için gerekli değil
+    # for drone_id in [1, 2, 3]:
+    #     per_drone_nodes.append(
+    #         TimerAction(
+    #             period=48.0,
+    #             actions=[
+    #                 Node(
+    #                     package='ros_gz_image',
+    #                     executable='image_bridge',
+    #                     arguments=[f'/drone{drone_id}/camera/image'],
+    #                     remappings=[(
+    #                         f'/drone{drone_id}/camera/image',
+    #                         f'/drone{drone_id}/camera/image_raw'
+    #                     )],
+    #                     output='log',
+    #                     additional_env=dict(env),
+    #                 )
+    #             ]
+    #         )
+    #     )
 
     args.extend(per_drone_nodes)
 
@@ -554,29 +569,30 @@ def generate_launch_description():
         LogInfo(msg='🎮 MISSION FSM DASHBOARD açılıyor (yeni xterm\'de)...')
     )
 
-    gcs_nodes.append(
-        TimerAction(
-            period=10.7,
-            actions=[
-                ExecuteProcess(
-                    cmd=[
-                        'xterm',
-                        '-title', 'Mission FSM Dashboard',
-                        '-e', 'bash', '-c',
-                        f'source {ws}/install/setup.bash && '
-                        f'export GZ_SIM_RESOURCE_PATH={env["GZ_SIM_RESOURCE_PATH"]} && '
-                        f'export GZ_SIM_SYSTEM_PLUGIN_PATH={env["GZ_SIM_SYSTEM_PLUGIN_PATH"]} && '
-                        f'export ROS_LOCALHOST_ONLY=1 && '
-                        f'export FASTRTPS_DEFAULT_PROFILES_FILE={fastdds_profile} && '
-                        f'export CYCLONEDDS_URI={env["CYCLONEDDS_URI"]} && '
-                        f'ros2 run my_swarm_pkg mission_fsm'
-                    ],
-                    output='screen',
-                    additional_env=env,
-                )
-            ]
-        )
-    )
+    # mission_fsm xterm geçici olarak devre dışı — formasyon testi için gerekli değil
+    # gcs_nodes.append(
+    #     TimerAction(
+    #         period=47.0,
+    #         actions=[
+    #             ExecuteProcess(
+    #                 cmd=[
+    #                     'xterm',
+    #                     '-title', 'Mission FSM Dashboard',
+    #                     '-e', 'bash', '-c',
+    #                     f'source {ws}/install/setup.bash && '
+    #                     f'export GZ_SIM_RESOURCE_PATH={env["GZ_SIM_RESOURCE_PATH"]} && '
+    #                     f'export GZ_SIM_SYSTEM_PLUGIN_PATH={env["GZ_SIM_SYSTEM_PLUGIN_PATH"]} && '
+    #                     f'export ROS_LOCALHOST_ONLY=1 && '
+    #                     f'export FASTRTPS_DEFAULT_PROFILES_FILE={fastdds_profile} && '
+    #                     f'export CYCLONEDDS_URI={env["CYCLONEDDS_URI"]} && '
+    #                     f'ros2 run my_swarm_pkg mission_fsm'
+    #                 ],
+    #                 output='screen',
+    #                 additional_env=env,
+    #             )
+    #         ]
+    #     )
+    # )
 
     args.extend(gcs_nodes)
 
@@ -585,19 +601,20 @@ def generate_launch_description():
     #    25s sonra MAVROS cmd/command servisiyle ArduPilot'a
     #    MAV_CMD_SET_MESSAGE_INTERVAL (511) gönderir → local_position/pose çalışır
     # ═══════════════════════════════════════════════════════════════════════
-    stream_script = os.path.join(pkg_dir, 'config/activate_streams.py')
-    args.append(
-        TimerAction(
-            period=60.0,
-            actions=[
-                ExecuteProcess(
-                    cmd=['python3', stream_script],
-                    output='screen',
-                    additional_env=env,
-                )
-            ]
-        )
-    )
+    # activate_streams geçici olarak devre dışı — formasyon testi için gerekli değil
+    # stream_script = os.path.join(pkg_dir, 'config/activate_streams.py')
+    # args.append(
+    #     TimerAction(
+    #         period=60.0,
+    #         actions=[
+    #             ExecuteProcess(
+    #                 cmd=['python3', stream_script],
+    #                 output='screen',
+    #                 additional_env=env,
+    #             )
+    #         ]
+    #     )
+    # )
 
     # ═══════════════════════════════════════════════════════════════════════
     # KAPANIŞ BANNER

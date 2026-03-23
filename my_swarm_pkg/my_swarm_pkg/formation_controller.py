@@ -132,6 +132,10 @@ class DroneState:
 # (fwd_norm, left_norm): spacing=1m için normalize edilmiş ofsetler
 # KRİTİK: Her n için Σ(fwd_i)/n = 0  ve  Σ(left_i)/n = 0 olmalı!
 
+# sin(60°) = 0.866 — eşkenar üçgen geometrisi için
+# Bu sayede SPACING=5m verildiğinde her drone çiftinin arasındaki mesafe tam 5m olur.
+_SIN60 = 0.866
+
 FORMATION_OFFSETS: dict[str, dict[int, list[tuple[float, float]]]] = {
 
     # ── OKBASI (Ok Başı / Arrow Tip) ────────────────────────────────────────
@@ -139,7 +143,7 @@ FORMATION_OFFSETS: dict[str, dict[int, list[tuple[float, float]]]] = {
     #      [0]       ← lider ÖNDE (ok ucu, rank-0 = en küçük ID)
     #   [1]   [2]    ← kanatlar ARKADA
     'OKBASI': {
-        3: [(+2/3,   0.0), (-1/3,  -0.5), (-1/3,  +0.5)],
+        3: [(+_SIN60*2/3, 0.0), (-_SIN60*1/3, -0.5), (-_SIN60*1/3, +0.5)],
         2: [(+0.5,   0.0), (-0.5,   0.0)],
         1: [( 0.0,   0.0)],
     },
@@ -149,7 +153,7 @@ FORMATION_OFFSETS: dict[str, dict[int, list[tuple[float, float]]]] = {
     #   [1]     [2]   ← takipçiler ÖNDE (V'nin kolları)
     #      [0]        ← lider ARKADA (V'nin dibi)
     'V': {
-        3: [(-2/3,   0.0), (+1/3,  -0.5), (+1/3,  +0.5)],
+        3: [(-_SIN60*2/3, 0.0), (+_SIN60*1/3, -0.5), (+_SIN60*1/3, +0.5)],
         2: [(-0.5,   0.0), (+0.5,   0.0)],
         1: [( 0.0,   0.0)],
     },
