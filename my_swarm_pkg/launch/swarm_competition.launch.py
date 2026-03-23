@@ -75,9 +75,9 @@ def generate_launch_description():
     # mavros_udp_port: MAVROS bağlantısı (udpclient → MAVROS dinliyor)
     # mp_udp_port    : Mission Planner bağlantısı (udpclient → MP dinliyor)
     DRONE_CONFIGS = [
-        ('drone1', 1, 14550, 14551, 7.33,  0.0,  0.0),
-        ('drone2', 2, 14560, 14561, 2.33, -2.5,  0.0),
-        ('drone3', 3, 14570, 14571, 2.33,  2.5,  0.0),
+        ('drone1', 1, 14550, 14551,  0.0,  0.0,  0.0),
+        ('drone2', 2, 14560, 14561,  0.0, -5.0,  0.0),
+        ('drone3', 3, 14570, 14571,  0.0,  5.0,  0.0),
     ]
 
     # ── GEOFENCİNG PARAMETRE (Güvenlik) ───────────────────────────────────
@@ -286,7 +286,7 @@ def generate_launch_description():
     per_drone_nodes = []
 
     for ns, sysid, mavros_port, mp_port, hx, hy, hz in DRONE_CONFIGS:
-        delay = 9.0 + (sysid - 1) * 0.5
+        delay = 25.0 + (sysid - 1) * 0.5
         
         env_vars = {
             'DRONE_NS': ns,

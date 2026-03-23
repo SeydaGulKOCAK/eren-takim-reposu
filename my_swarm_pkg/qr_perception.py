@@ -66,7 +66,8 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 
 from geometry_msgs.msg import PoseStamped
-from swarm_msgs.msg import LocalState, QRResult, ColorZone, ColorZoneList
+from sensor_msgs.msg import Image as RosImage
+from swarm_msgs.msg import LocalState, QRResult, ColorZone, ColorZoneList, SwarmIntent
 from std_msgs.msg import Bool
 from swarm_msgs.srv import SetQRMap
 
@@ -75,6 +76,52 @@ try:
     _AMENT_AVAILABLE = True
 except ImportError:
     _AMENT_AVAILABLE = False
+
+try:
+    import cv2
+    _CV2_AVAILABLE = True
+except ImportError:
+    _CV2_AVAILABLE = False
+
+try:
+    from cv_bridge import CvBridge
+    _CVBRIDGE_AVAILABLE = True
+except ImportError:
+    _CVBRIDGE_AVAILABLE = False
+
+try:
+    import pyzbar.pyzbar as pyzbar
+    _PYZBAR_AVAILABLE = True
+except ImportError:
+    _PYZBAR_AVAILABLE = False
+
+try:
+    import numpy as _np
+    _NP_AVAILABLE = True
+except ImportError:
+    _NP_AVAILABLE = False
+
+try:
+    from gz.transport13 import Node as GzNode
+    from gz.msgs10.image_pb2 import Image as GzImage
+    _GZ_TRANSPORT_AVAILABLE = True
+except ImportError:
+    _GZ_TRANSPORT_AVAILABLE = False
+
+import time as _time
+import threading as _threading
+
+# Hibrit tarama faz süreleri [s]
+_LEADER_TIMEOUT_S    = 1.5   # Leader okuyamazsa → nearest drone
+_NEAREST_TIMEOUT_S   = 1.5   # Nearest okuyamazsa → all scan
+_PROXIMITY_FALLBACK_S = 3.0  # ALL_SCAN fazında bu kadar sonra proximity fallback devreye girer
+
+# ── ADAPTİF ZOOM PARAMETRELERİ ────────────────────────────────────────────
+# Referans: 640px kamerada 1.2m QR → yükseklik arttıkça piksel boyutu düşer
+# zoom = altitude / _ZOOM_REF_ALT  (clamp: [_ZOOM_MIN, _ZOOM_MAX])
+_ZOOM_REF_ALT = 5.0   # Bu yükseklikte zoom=1x (QR zaten büyük)
+_ZOOM_MIN     = 2.0    # Minimum zoom (düşük irtifada bile 2x)
+_ZOOM_MAX     = 8.0    # Maximum zoom (çok yüksekte pikselasyon sınırı)
 
 # Kamera failover'ı tetikleyen yerel durumlar
 _FAILOVER_STATES = frozenset({'DETACH', 'SAFETY_HOLD', 'PILOT_OVERRIDE'})
@@ -94,6 +141,7 @@ class QRPerception(Node):
         self.declare_parameter('num_drones',             3)
         self.declare_parameter('trigger_radius',         5.0)
         self.declare_parameter('qr_map_file',            '')
+        self.declare_parameter('use_camera',             True)
 
         self._team_id        = self.get_parameter('team_id').value
         self._primary_cam_id = self.get_parameter('camera_drone_id').value
@@ -101,13 +149,23 @@ class QRPerception(Node):
         self._num_drones     = self.get_parameter('num_drones').value
         self._trigger_radius = self.get_parameter('trigger_radius').value
         qr_map_file          = self.get_parameter('qr_map_file').value
+        self._use_camera     = self.get_parameter('use_camera').value
 
         # 'team1' → 'team_1' (YAML anahtar uyumu)
         self._team_key = self._team_id.replace('team', 'team_')
 
-        # Aktif kamera drone
+        # Aktif kamera drone (failover için)
         self._camera_drone_id: int  = self._primary_cam_id
         self._failover_active: bool = False
+
+        # ── HİBRİT TARAMA DURUMU ─────────────────────────────────────────
+        # Faz sırası: IDLE → LEADER → NEAREST → ALL_SCAN
+        self._leader_id:        int       = self._primary_cam_id  # SwarmIntent'ten güncellenir
+        self._scan_phase:       str       = 'ALL_SCAN'
+        self._scan_phase_start: float     = 0.0
+        self._active_cams:      set[int]  = set(range(1, self._num_drones + 1))
+        self._trigger_active:   bool      = False   # trigger gelene kadar decode yapma
+        self._target_qr_seq:    int       = 0       # SwarmIntent'ten hedef QR seq
 
         # ── QR HARİTASI ──────────────────────────────────────────────────
         if not qr_map_file:
@@ -131,6 +189,9 @@ class QRPerception(Node):
         }
         self._read_qr_ids: set[int] = set()   # aynı QR iki kez okunmaz
 
+        # ── cv_bridge ────────────────────────────────────────────────────
+        self._bridge = CvBridge() if _CVBRIDGE_AVAILABLE else None
+
         # ── QoS ─────────────────────────────────────────────────────────
         be_qos = QoSProfile(
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
@@ -150,20 +211,99 @@ class QRPerception(Node):
                 lambda msg, did=i: self._on_pose(msg, did), be_qos)
             self.create_subscription(
                 LocalState, f'/drone{i}/local_state',
-                lambda msg, did=i: self._on_local_state(msg, did), 10)
+                lambda msg, did=i: self._on_local_state(msg, did), be_qos)
+
+        # ── KAMERA ABONELİKLERİ ─────────────────────────────────────────
+        # Öncelik: GZ transport (doğrudan, thread'de) > ROS2 image_raw (cv_bridge)
+        self._gz_camera_active = False
+        _cam_ok = _CV2_AVAILABLE and _PYZBAR_AVAILABLE and _NP_AVAILABLE
+
+        if self._use_camera and _cam_ok and _GZ_TRANSPORT_AVAILABLE:
+            # GZ transport — ayrı thread'de frame buffer'a alır,
+            # ROS2 timer ile process eder (spin ile çakışmaz)
+            self._gz_lock = _threading.Lock()
+            self._gz_frame_buffer: dict[int, tuple] = {}  # drone_id → (gray, time)
+
+            def _gz_thread_fn():
+                gz_node = GzNode()
+                for cam_id in range(1, self._num_drones + 1):
+                    gz_node.subscribe(
+                        GzImage,
+                        f'/drone{cam_id}/camera/image',
+                        lambda msg, did=cam_id: self._gz_buffer_frame(msg, did),
+                    )
+                self.get_logger().info(
+                    f'   GZ kamera thread başladı — {self._num_drones} kamera')
+                import signal
+                signal.sigwait({signal.SIGTERM})  # Thread sonsuza kadar yaşar
+
+            self._gz_thread = _threading.Thread(
+                target=_gz_thread_fn, daemon=True)
+            self._gz_thread.start()
+            self._gz_camera_active = True
+
+            # 5 Hz timer — buffer'daki en yeni frame'i process et
+            self.create_timer(0.2, self._gz_poll_frames)
+            self.get_logger().info(
+                f'   Kamera QR modu: AKTIF (GZ transport thread + pyzbar)')
+
+        elif self._use_camera and _cam_ok and _CVBRIDGE_AVAILABLE:
+            # Fallback: ROS2 image_raw (ros_gz_bridge gerektirir)
+            cam_qos = QoSProfile(
+                reliability=QoSReliabilityPolicy.RELIABLE,
+                history=QoSHistoryPolicy.KEEP_LAST,
+                depth=1,
+            )
+            for cam_id in range(1, self._num_drones + 1):
+                self.create_subscription(
+                    RosImage,
+                    f'/drone{cam_id}/camera/image_raw',
+                    lambda msg, did=cam_id: self._on_camera_image(msg, did),
+                    cam_qos,
+                )
+            self.get_logger().info(
+                f'   Kamera QR modu: AKTIF (ROS2 image_raw + cv_bridge)')
+        else:
+            missing = []
+            if not _CV2_AVAILABLE:           missing.append('opencv-python')
+            if not _PYZBAR_AVAILABLE:        missing.append('pyzbar')
+            if not _NP_AVAILABLE:            missing.append('numpy')
+            if not _GZ_TRANSPORT_AVAILABLE:  missing.append('gz.transport13')
+            if not _CVBRIDGE_AVAILABLE:      missing.append('cv_bridge')
+            if missing:
+                self.get_logger().warn(
+                    f'   Kamera QR modu: KAPALI — eksik: {", ".join(missing)}'
+                )
+
+        # ── HİBRİT TARAMA ABONELİKLERİ ──────────────────────────────────
+        # QR trigger (waypoint_navigator'dan) — RELIABLE QoS eşleşmesi
+        trigger_qos = QoSProfile(
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=10,
+        )
+        self.create_subscription(Bool, '/qr/trigger', self._on_qr_trigger, trigger_qos)
+        # Lider ID (SwarmIntent'ten)
+        self.create_subscription(SwarmIntent, '/swarm/intent', self._on_swarm_intent, 10)
 
         # ── RUNTIME QR MAP GÜNCELLEME (JÜRİ KOORDİNATI) ──────────────
-        self.create_service(SetQRMap, '/swarm/set_qr_map', 
+        self.create_service(SetQRMap, '/swarm/set_qr_map',
                           self._on_set_qr_map)
 
         # ── TIMER'LAR ────────────────────────────────────────────────────
-        self.create_timer(0.1, self._check_qr_proximity)   # 10 Hz
-        self.create_timer(1.0, self._publish_color_zones)  # 1 Hz
+        # Proximity fallback KAPALI — sadece kamera (pyzbar) ile QR okunur
+        # self.create_timer(0.1,  self._check_qr_proximity)   # DEVRE DIŞI
+        self.create_timer(0.5,  self._advance_scan_phase)   # 2 Hz — faz ilerletme
+        self.create_timer(1.0,  self._publish_color_zones)  # 1 Hz
+        # Startup'ta YAML haritası yüklendiyse 2s sonra ready sinyali gönder
+        if self._qr_nodes:
+            self._startup_ready_timer = self.create_timer(2.0, self._publish_startup_ready)
 
         self.get_logger().info(
-            f'\n📷 qr_perception hazır!\n'
-            f'   Takım ID     : {self._team_id}  (YAML key: {self._team_key})\n'
+            f'\nqr_perception hazir!\n'
+            f'   Takim ID     : {self._team_id}  (YAML key: {self._team_key})\n'
             f'   Kamera drone : drone{self._camera_drone_id}\n'
+            f'   Gorsel QR    : {"AKTIF (pyzbar)" if (self._use_camera and _PYZBAR_AVAILABLE and _CVBRIDGE_AVAILABLE) else "KAPALI (proximity yedek)"}\n'
             f'   Yedek        : drone{self._backup_cam_id}\n'
             f'   QR düğüm     : {len(self._qr_nodes)}\n'
             f'   Renk zone    : {len(self._color_zones)}\n'
@@ -210,6 +350,14 @@ class QRPerception(Node):
             self.get_logger().error(f'❌ Yükleme hatası: {e}')
 
     # ── CALLBACK'LER ─────────────────────────────────────────────────────
+
+    def _publish_startup_ready(self):
+        """Startup YAML yüklemesinden sonra bir kez qr_map_ready yayınla."""
+        msg = Bool()
+        msg.data = True
+        self._map_ready_pub.publish(msg)
+        self.get_logger().info('✅ QR haritası HAZIR sinyali gönderildi (YAML startup).')
+        self._startup_ready_timer.cancel()
 
     # ── RUNTIME QR MAP GÜNCELLEME ────────────────────────────────────────
 
@@ -314,6 +462,346 @@ class QRPerception(Node):
             return response
 
 
+    # ── HİBRİT TARAMA CALLBACK'LERİ ──────────────────────────────────────
+
+    def _on_swarm_intent(self, msg: SwarmIntent) -> None:
+        """Lider drone ID'sini ve hedef QR seq'i takip et."""
+        self._leader_id = int(msg.leader_id)
+        self._target_qr_seq = int(msg.qr_seq)
+
+    def _on_qr_trigger(self, msg: Bool) -> None:
+        """
+        waypoint_navigator QR bölgesine girince True gönderir.
+        True → decode aktif, False → decode pasif.
+        """
+        self._trigger_active = msg.data
+        if msg.data:
+            self.get_logger().info(
+                f'📸 QR trigger AKTİF — hedef QR#{self._target_qr_seq} '
+                f'(active_cams={self._active_cams})'
+            )
+        else:
+            self.get_logger().info('📸 QR trigger KAPANDI — decode pasif')
+
+    def _get_nearest_drone_to_target_qr(self) -> int:
+        """
+        Mevcut hedefe (centroide en yakın okunmamış QR) en yakın flying drone'u döndür.
+        Bulunamazsa leader_id döndür.
+        """
+        # Centroid hesapla
+        flying = [
+            p for i, p in self._drone_poses.items()
+            if p is not None and self._drone_states.get(i, '') in (
+                'FLYING', 'DETACH', 'REJOIN', 'LAND_ZONE'
+            )
+        ]
+        if not flying:
+            return self._leader_id
+
+        cx = sum(p.pose.position.x for p in flying) / len(flying)
+        cy = sum(p.pose.position.y for p in flying) / len(flying)
+
+        # Centroide en yakın okunmamış QR
+        target_pos = None
+        min_d_qr = float('inf')
+        for qr_id, qr_data in self._qr_nodes.items():
+            if qr_id in self._read_qr_ids:
+                continue
+            pos = qr_data.get('position', {})
+            dx = cx - float(pos.get('x', 0.0))
+            dy = cy - float(pos.get('y', 0.0))
+            d  = math.sqrt(dx * dx + dy * dy)
+            if d < min_d_qr:
+                min_d_qr   = d
+                target_pos = (float(pos.get('x', 0.0)), float(pos.get('y', 0.0)))
+
+        if target_pos is None:
+            return self._leader_id
+
+        # Bu QR'a en yakın drone (leader hariç)
+        best_id = self._leader_id
+        best_d  = float('inf')
+        for did, pose in self._drone_poses.items():
+            if pose is None or did == self._leader_id:
+                continue
+            if self._drone_states.get(did, '') not in ('FLYING', 'DETACH', 'REJOIN'):
+                continue
+            dx = pose.pose.position.x - target_pos[0]
+            dy = pose.pose.position.y - target_pos[1]
+            d  = math.sqrt(dx * dx + dy * dy)
+            if d < best_d:
+                best_d  = d
+                best_id = did
+        return best_id
+
+    def _advance_scan_phase(self) -> None:
+        """
+        2 Hz timer — hibrit tarama faz ilerletme.
+        LEADER → NEAREST → ALL_SCAN
+        """
+        if self._scan_phase == 'IDLE':
+            return
+
+        elapsed = _time.time() - self._scan_phase_start
+
+        if self._scan_phase == 'LEADER' and elapsed >= _LEADER_TIMEOUT_S:
+            nearest = self._get_nearest_drone_to_target_qr()
+            self._scan_phase       = 'NEAREST'
+            self._scan_phase_start = _time.time()
+            self._active_cams      = {nearest}
+            self.get_logger().warn(
+                f'⚠️  LEADER ({_LEADER_TIMEOUT_S}s) okuyamadı → '
+                f'NEAREST: drone{nearest} kamerası aktif'
+            )
+
+        elif self._scan_phase == 'NEAREST' and elapsed >= _NEAREST_TIMEOUT_S:
+            all_ids = set(range(1, self._num_drones + 1))
+            self._scan_phase       = 'ALL_SCAN'
+            self._scan_phase_start = _time.time()
+            self._active_cams      = all_ids
+            self.get_logger().warn(
+                f'⚠️  NEAREST ({_NEAREST_TIMEOUT_S}s) okuyamadı → '
+                f'ALL_SCAN: tüm kameralar aktif {sorted(all_ids)}'
+            )
+
+    _cam_log_count: int = 0
+
+    def _gz_buffer_frame(self, gz_msg, drone_id: int) -> None:
+        """GZ transport callback (ayrı thread) — frame'i buffer'a yaz."""
+        try:
+            w, h = gz_msg.width, gz_msg.height
+            data = gz_msg.data
+            channels = len(data) // (w * h) if w * h > 0 else 3
+
+            if channels == 3:
+                img = _np.frombuffer(data, dtype=_np.uint8).reshape(h, w, 3)
+                gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+            elif channels == 4:
+                img = _np.frombuffer(data, dtype=_np.uint8).reshape(h, w, 4)
+                gray = cv2.cvtColor(img, cv2.COLOR_RGBA2GRAY)
+            else:
+                gray = _np.frombuffer(data, dtype=_np.uint8).reshape(h, w)
+
+            with self._gz_lock:
+                self._gz_frame_buffer[drone_id] = (gray, _time.time())
+        except Exception:
+            pass  # Thread'de hata yutulur, poll timer loglar
+
+    def _gz_poll_frames(self) -> None:
+        """5 Hz ROS2 timer — buffer'daki frame'leri process et."""
+        with self._gz_lock:
+            frames = dict(self._gz_frame_buffer)
+
+        for drone_id, (gray, ts) in frames.items():
+            # 1 saniyeden eski frame'i atla
+            if _time.time() - ts > 1.0:
+                continue
+            if drone_id not in self._active_cams:
+                continue
+
+            self._cam_log_count += 1
+            if self._cam_log_count <= 5 or self._cam_log_count % 100 == 0:
+                self.get_logger().info(
+                    f'📸 GZ frame #{self._cam_log_count} — drone{drone_id} '
+                    f'({gray.shape[1]}x{gray.shape[0]})')
+
+            self._process_gray_image(gray, drone_id)
+
+            # Process edilen frame'i buffer'dan sil
+            with self._gz_lock:
+                self._gz_frame_buffer.pop(drone_id, None)
+
+    def _on_camera_image(self, msg: RosImage, drone_id: int) -> None:
+        """ROS2 image_raw callback (cv_bridge → grayscale → pyzbar)."""
+        self._cam_log_count += 1
+        if self._cam_log_count <= 5 or self._cam_log_count % 200 == 0:
+            self.get_logger().info(
+                f'📸 Kamera frame #{self._cam_log_count} — drone{drone_id} '
+                f'({msg.width}x{msg.height})')
+
+        if drone_id not in self._active_cams:
+            return
+        if not (_CV2_AVAILABLE and _CVBRIDGE_AVAILABLE and _PYZBAR_AVAILABLE):
+            return
+        if self._bridge is None:
+            return
+        try:
+            cv_img = self._bridge.imgmsg_to_cv2(msg, 'bgr8')
+        except Exception as e:
+            self.get_logger().warn(
+                f'Goruntu donusum hatasi: {e}', throttle_duration_sec=5.0)
+            return
+        gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
+        self._process_gray_image(gray, drone_id)
+
+    def _get_drone_altitude(self, drone_id: int) -> float:
+        """Drone'un mevcut irtifasını döndür (pose z). Bilinmiyorsa 15.0 varsayılan."""
+        pose = self._drone_poses.get(drone_id)
+        if pose is not None:
+            return abs(pose.pose.position.z)
+        return 15.0  # varsayılan orta irtifa
+
+    def _calc_zoom_factor(self, altitude: float) -> float:
+        """
+        İrtifaya göre adaptif zoom faktörü hesapla.
+          10m → 2.0x    15m → 3.0x    20m → 4.0x    25m → 5.0x
+        """
+        zoom = altitude / _ZOOM_REF_ALT
+        return max(_ZOOM_MIN, min(_ZOOM_MAX, zoom))
+
+    def _find_qr_contour_crop(self, gray):
+        """
+        Beyaz dikdörtgen bölgeleri (QR kağıt) contour ile bul,
+        crop edip decode et. Gazebo render'da en güvenilir yöntem.
+        """
+        _, thresh = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
+        contours, _ = cv2.findContours(
+            thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        h, w = gray.shape
+        candidates = []
+        for c in contours:
+            area = cv2.contourArea(c)
+            if area < 400:
+                continue
+            x, y, bw, bh = cv2.boundingRect(c)
+            aspect = min(bw, bh) / max(bw, bh) if max(bw, bh) > 0 else 0
+            if aspect > 0.5:
+                candidates.append((area, x, y, bw, bh))
+
+        candidates.sort(reverse=True)
+
+        for area, x, y, bw, bh in candidates[:5]:
+            pad = max(bw, bh) // 4
+            x1 = max(0, x - pad)
+            y1 = max(0, y - pad)
+            x2 = min(w, x + bw + pad)
+            y2 = min(h, y + bh + pad)
+            crop = gray[y1:y2, x1:x2]
+
+            for z in [3, 4, 5, 6]:
+                crop_up = cv2.resize(
+                    crop, (crop.shape[1] * z, crop.shape[0] * z),
+                    interpolation=cv2.INTER_CUBIC)
+                r = pyzbar.decode(crop_up)
+                if r:
+                    return r
+                _, bn = cv2.threshold(
+                    crop_up, 0, 255,
+                    cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                r = pyzbar.decode(bn)
+                if r:
+                    return r
+        return []
+
+    def _process_gray_image(self, gray, drone_id: int) -> None:
+        """
+        Ortak pyzbar decode pipeline.
+        1) Contour-based crop + zoom (en güvenilir)
+        2) Parçalı tile tarama (fallback)
+
+        Sadece trigger aktifken çalışır — yolda geçerken yanlış QR okumayı önler.
+        """
+        # Trigger aktif değilse decode yapma
+        if not self._trigger_active:
+            return
+
+        # Kontrast artır (CLAHE)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        gray = clahe.apply(gray)
+
+        h, w = gray.shape
+        altitude = self._get_drone_altitude(drone_id)
+        zoom = self._calc_zoom_factor(altitude)
+        zoom_int = max(2, int(round(zoom)))
+
+        # 1) CONTOUR-BASED: QR'ı beyaz bölge olarak bul, crop et, decode et
+        decoded_list = self._find_qr_contour_crop(gray)
+
+        # 2) Fallback: parçalı tile tarama
+        if not decoded_list:
+            decoded_list = self._scan_tiles(gray, drone_id, zoom_int + 1)
+
+        if not decoded_list:
+            self._cam_log_count += 1
+            if self._cam_log_count <= 10 or self._cam_log_count % 50 == 0:
+                self.get_logger().info(
+                    f'🔍 drone{drone_id} kamera — QR bulunamadı '
+                    f'(gray {h}x{w}, alt={altitude:.0f}m, '
+                    f'zoom={zoom_int}x)'
+                )
+
+        for obj in decoded_list:
+            try:
+                import json as _json
+                data = _json.loads(obj.data.decode('utf-8'))
+                qr_id = int(data.get('qr_id', 0))
+            except Exception:
+                continue
+
+            if qr_id == 0 or qr_id in self._read_qr_ids:
+                continue
+
+            # Hedef QR filtresi — sadece hedef QR seq'ini kabul et
+            if self._target_qr_seq > 0 and qr_id != self._target_qr_seq:
+                self.get_logger().warn(
+                    f'⚠️  QR{qr_id} okundu ama hedef QR#{self._target_qr_seq} '
+                    f'— yoksayıldı (yolda geçiş)')
+                continue
+
+            self.get_logger().info(
+                f'📷 [KAMERA] QR{qr_id} okundu — drone{drone_id} '
+                f'(alt={altitude:.0f}m, zoom={zoom_int}x, faz={self._scan_phase})'
+            )
+            # Başarılı decode — kameralar açık kalsın sonraki QR'lar için
+
+            # YAML pozisyonunu koru, içeriği kameradan al
+            if qr_id in self._qr_nodes:
+                qr_data = dict(self._qr_nodes[qr_id])
+                qr_data['content'] = data
+            else:
+                qr_data = {
+                    'content':  data,
+                    'position': {'x': 0.0, 'y': 0.0, 'z': 0.0},
+                }
+
+            self._publish_qr_result(qr_id, qr_data)
+            self._read_qr_ids.add(qr_id)
+
+    def _scan_tiles(self, gray, drone_id: int, tile_zoom: int = 3):
+        """
+        Frame'i 3x3 overlapping tile'lara böl, her birini tile_zoom x büyütüp tara.
+        %50 overlap — QR bir tile sınırına denk gelse bile komşu tile yakalar.
+
+        tile_zoom: adaptif — yüksek irtifada daha agresif büyütme.
+        """
+        h, w = gray.shape
+        tile_h = h // 2   # %50 overlap için tile boyutu = frame/2
+        tile_w = w // 2
+        step_h = h // 3   # 3 adım = 3x3 grid
+        step_w = w // 3
+
+        for row in range(3):
+            for col in range(3):
+                y0 = min(row * step_h, h - tile_h)
+                x0 = min(col * step_w, w - tile_w)
+                tile = gray[y0:y0 + tile_h, x0:x0 + tile_w]
+
+                # Adaptif tile zoom — irtifa arttıkça daha fazla büyütme
+                tile_up = cv2.resize(tile, (tile_w * tile_zoom, tile_h * tile_zoom),
+                                     interpolation=cv2.INTER_LANCZOS4)
+                decoded = pyzbar.decode(tile_up)
+                if decoded:
+                    return decoded
+                # Threshold ile tekrar dene
+                _, tile_bin = cv2.threshold(tile_up, 0, 255,
+                                            cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                decoded = pyzbar.decode(tile_bin)
+                if decoded:
+                    return decoded
+
+        return []
+
     def _on_pose(self, msg: PoseStamped, drone_id: int):
         self._drone_poses[drone_id] = msg
 
@@ -343,13 +831,35 @@ class QRPerception(Node):
     # ── QR YAKIŞLIK KONTROLÜ (10 Hz) ────────────────────────────────────
 
     def _check_qr_proximity(self):
-        """Kamera drone'u QR'a yeterince yaklaştı mı? → QRResult yayınla."""
-        cam_pose = self._drone_poses.get(self._camera_drone_id)
-        if cam_pose is None:
-            return
+        """
+        Proximity fallback — SADECE ALL_SCAN fazında ve _PROXIMITY_FALLBACK_S
+        geçtikten sonra devreye girer.  Kamera (pyzbar) her zaman önceliklidir.
 
-        cx = cam_pose.pose.position.x
-        cy = cam_pose.pose.position.y
+        Akış:  LEADER kamera (1.5s) → NEAREST kamera (1.5s) → ALL kamera + proximity
+        """
+        # ── Proximity sadece ALL_SCAN fazında son çare ──────────────────
+        if self._scan_phase != 'ALL_SCAN':
+            return
+        elapsed_all = _time.time() - self._scan_phase_start
+        if elapsed_all < _PROXIMITY_FALLBACK_S:
+            return  # ALL_SCAN fazında kameralar hâlâ deniyor
+
+        # ── Centroid hesapla ────────────────────────────────────────────
+        flying_poses = [
+            p for i, p in self._drone_poses.items()
+            if p is not None and self._drone_states.get(i, '') in (
+                'FLYING', 'DETACH', 'REJOIN', 'LAND_ZONE', 'RETURN_HOME'
+            )
+        ]
+        if flying_poses:
+            cx = sum(p.pose.position.x for p in flying_poses) / len(flying_poses)
+            cy = sum(p.pose.position.y for p in flying_poses) / len(flying_poses)
+        else:
+            cam_pose = self._drone_poses.get(self._camera_drone_id)
+            if cam_pose is None:
+                return
+            cx = cam_pose.pose.position.x
+            cy = cam_pose.pose.position.y
 
         for qr_id, qr_data in self._qr_nodes.items():
             if qr_id in self._read_qr_ids:
@@ -361,10 +871,14 @@ class QRPerception(Node):
             dist = math.sqrt(dx * dx + dy * dy)
 
             if dist <= self._trigger_radius:
-                self.get_logger().info(
-                    f'📍 QR{qr_id} menzilinde! mesafe={dist:.2f}m')
+                self.get_logger().warn(
+                    f'⚠️  [PROXIMITY FALLBACK] QR{qr_id} — kamera okuyamadı, '
+                    f'YAML fallback! mesafe={dist:.2f}m')
                 self._publish_qr_result(qr_id, qr_data)
                 self._read_qr_ids.add(qr_id)
+                # Fallback başarılı → taramayı kapat
+                self._scan_phase  = 'IDLE'
+                self._active_cams = set()
 
     # ── QR SONUCU YAYINLAMA ──────────────────────────────────────────────
 
@@ -414,7 +928,7 @@ class QRPerception(Node):
         # Formasyon
         msg.formation_active = bool(frm.get('aktif', False))
         msg.formation_type   = str(frm.get('tip',   'OKBASI'))
-        msg.drone_spacing    = 6.0   # sabit — şartname §5.2.1
+        msg.drone_spacing    = 5.0   # sabit — şartname §5.2.1 (intent_coordinator default ile tutarlı)
 
         # İrtifa
         msg.altitude_active  = bool(irtifa.get('aktif', False))

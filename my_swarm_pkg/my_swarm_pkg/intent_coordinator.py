@@ -70,6 +70,11 @@ import math
 import os
 import yaml
 
+# Simülasyonda: QR Gazebo world frame → MAVROS local frame dönüşümü
+# Yarışta GPS ortak frame → HOME=0,0 → dönüşüm etkisiz
+_HOME_X = float(os.environ.get('HOME_X', '0.0'))
+_HOME_Y = float(os.environ.get('HOME_Y', '0.0'))
+
 import rclpy
 from rclpy.node import Node
 from rclpy.time import Time
@@ -92,6 +97,7 @@ from swarm_msgs.msg import (
 class DroneState:
     STANDBY        = 'STANDBY'
     IDLE           = 'IDLE'
+    TAKING_OFF     = 'TAKING_OFF'
     FLYING         = 'FLYING'
     DETACH         = 'DETACH'
     LAND_ZONE      = 'LAND_ZONE'
@@ -105,11 +111,11 @@ class DroneState:
 
     # Lider adayı olabilecek state'ler
     # REJOIN da dahil: sürüye katılmakta olan drone da lider seçilebilir
-    LEADER_ELIGIBLE = frozenset({FLYING, REJOIN})
+    LEADER_ELIGIBLE = frozenset({TAKING_OFF, FLYING, REJOIN})
 
     # "Havada" sayılan state'ler (active_drone_count için)
     # DETACH, LAND_ZONE: henüz yerdeymiş gibi sayılmaz
-    AIRBORNE = frozenset({FLYING, DETACH, LAND_ZONE, REJOIN, RETURN_HOME})
+    AIRBORNE = frozenset({TAKING_OFF, FLYING, DETACH, LAND_ZONE, REJOIN, RETURN_HOME})
 
     # "Devre dışı" state'ler → lider adayı olamaz, aktif sayılmaz
     INACTIVE = frozenset({DISARM_WAIT, LANDING, SAFETY_HOLD, PILOT_OVERRIDE})
@@ -236,7 +242,7 @@ class IntentCoordinator(Node):
         self._drone_spacing:   float = 5.0
         self._target_yaw:      float = 0.0
         self._target_pos:      Point = Point()
-        self._drone_altitude:  float = 8.0
+        self._drone_altitude:  float = 10.0
         self._detach_drone_id: int   = 0    # 0 = kimse ayrılmıyor
         self._zone_color:      str   = ''
         self._maneuver_active: bool  = False
@@ -403,19 +409,18 @@ class IntentCoordinator(Node):
         )
 
         # ── ÖZEL DURUM: ARMING → NAVIGATING ─────────────────────────────
-        # Drone IDLE oldu (ARM komutu alındı) → tüm drone'lar IDLE mi? → NAVIGATING'e geç
-        # NOT: local_fsm IDLE→FLYING ancak QR_NAVIGATE ile geçer, bu yüzden IDLE kontrolü gerekli
-        if (msg.state == DroneState.IDLE
+        # Tüm drone'lar FLYING olmalı (hepsi havada) → ancak o zaman NAVIGATING'e geç
+        if (msg.state == DroneState.FLYING
                 and self._mission_phase == MissionPhase.ARMING
                 and self._is_leader):
-            idle_or_flying = sum(
+            flying_count = sum(
                 1 for did in range(1, self.num_drones + 1)
-                if self._drone_state.get(did) in {DroneState.IDLE, DroneState.FLYING}
+                if self._drone_state.get(did) == DroneState.FLYING
             )
-            if idle_or_flying >= self.num_drones:
+            if flying_count >= self.num_drones:
                 self._mission_phase = MissionPhase.NAVIGATING
                 self.get_logger().info(
-                    f'🚀 [{self.ns}] Tüm drone\'lar IDLE → NAVIGATING! '
+                    f'🚀 [{self.ns}] Tüm drone\'lar FLYING ({flying_count}/{self.num_drones}) → NAVIGATING! '
                     f'QR1 @ ({self._target_pos.x:.1f}, {self._target_pos.y:.1f})'
                 )
 
@@ -827,7 +832,7 @@ class IntentCoordinator(Node):
         # STANDBY/IDLE olanlar arasından seç
         pre_flight = [
             did for did in range(1, self.num_drones + 1)
-            if self._drone_state[did] in {DroneState.STANDBY, DroneState.IDLE}
+            if self._drone_state[did] in {DroneState.STANDBY, DroneState.IDLE, DroneState.TAKING_OFF}
             and self._is_alive(did)
         ]
         if pre_flight:
@@ -877,17 +882,16 @@ class IntentCoordinator(Node):
         if not self._is_leader or not self._task_active:
             return
 
-        # ARMING→NAVIGATING hızlı geçiş: tüm drone'lar zaten IDLE/FLYING ise
-        # (trigger geç alındığında drone'lar önceden IDLE'a geçmiş olabilir)
+        # ARMING→NAVIGATING geçiş: tüm drone'lar FLYING olmalı (hepsi havada)
         if self._mission_phase == MissionPhase.ARMING:
-            idle_or_flying = sum(
+            flying_count = sum(
                 1 for did in range(1, self.num_drones + 1)
-                if self._drone_state.get(did) in {DroneState.IDLE, DroneState.FLYING}
+                if self._drone_state.get(did) == DroneState.FLYING
             )
-            if idle_or_flying >= self.num_drones:
+            if flying_count >= self.num_drones:
                 self._mission_phase = MissionPhase.NAVIGATING
                 self.get_logger().info(
-                    f'🚀 [{self.ns}] Tüm drone\'lar IDLE/FLYING → NAVIGATING! '
+                    f'🚀 [{self.ns}] Tüm drone\'lar FLYING ({flying_count}/{self.num_drones}) → NAVIGATING! '
                     f'QR1 @ ({self._target_pos.x:.1f}, {self._target_pos.y:.1f})'
                 )
 
@@ -899,6 +903,57 @@ class IntentCoordinator(Node):
 
         # Formasyon komutunu ayrıca yayınla (formation_controller için)
         self._publish_formation_cmd()
+
+    # ── FORMATION OFFSET TABLES (lider kompanzasyonu için) ─────────
+    _FORMATION_OFFSETS = {
+        'OKBASI': {3: (2/3, 0.0), 2: (0.5, 0.0), 1: (0.0, 0.0)},
+        'V':      {3: (2/3, 0.0), 2: (0.5, 0.0), 1: (0.0, 0.0)},
+        'CIZGI':  {3: (0.0, 1.0), 2: (0.0, 0.5), 1: (0.0, 0.0)},
+    }
+
+    def _compensate_leader_offset(self, qr_pos: Point) -> Point:
+        """
+        QR pozisyonunu centroid hedefine dönüştürür:
+
+        NOT: İlk QR okunmadan önce (_last_qr_seq == 0) fiziksel başlangıç
+        formasyonu aktiftir. Bu durumda drone1'in centroid'den ofseti (0,0)
+        olduğundan kompanzasyon uygulanmaz — QR'ın tam üzerine gidilir.
+
+        1) Gazebo world → MAVROS local frame (HOME offset çıkar)
+           Yarışta GPS ortak frame → HOME=0 → etkisiz
+        2) Lider formasyon offset'ini çıkar
+           centroid_target = mavros_qr - leader_offset_rotated
+           Böylece: target_leader = centroid_target + leader_offset = mavros_qr
+
+        Sonuç: lider drone QR'ın tam üstüne gelir, formasyon korunur.
+        """
+        # İlk QR okunmadan önce fiziksel başlangıç formasyonu aktif —
+        # drone1'in ofseti (0,0) olduğundan kompanzasyon gerekmez
+        if self._last_qr_seq == 0:
+            return qr_pos
+
+        # QR koordinatları ortak frame'de (Gazebo world / GPS)
+        # HOME offset dönüşümü drone_interface'de yapılıyor
+        # Burada sadece lider formasyon offset'ini çıkar
+        ft = self._formation_type
+        n  = self.num_drones
+        offsets = self._FORMATION_OFFSETS.get(ft, {})
+        leader_off = offsets.get(n, (0.0, 0.0))
+        spacing = self._drone_spacing
+
+        yaw = self._target_yaw
+        dx = leader_off[0] * spacing
+        dy = leader_off[1] * spacing
+        cos_y = math.cos(yaw)
+        sin_y = math.sin(yaw)
+        world_dx = dx * cos_y - dy * sin_y
+        world_dy = dx * sin_y + dy * cos_y
+
+        compensated = Point()
+        compensated.x = qr_pos.x - world_dx
+        compensated.y = qr_pos.y - world_dy
+        compensated.z = qr_pos.z
+        return compensated
 
     def _build_intent(self):
         """
@@ -928,7 +983,7 @@ class IntentCoordinator(Node):
         # ── GÖREV FAZ → task_id ──────────────────────────────────────────
         phase = self._mission_phase
         if phase == MissionPhase.ARMING:
-            msg.task_id = 'IDLE'
+            msg.task_id = 'QR_NAVIGATE'  # Kalkış tetikle — tüm FLYING olunca NAVIGATING'e geçecek
         elif phase in (MissionPhase.NAVIGATING, MissionPhase.AT_QR):
             msg.task_id = 'MANEUVER' if self._maneuver_active else 'QR_NAVIGATE'
         elif phase == MissionPhase.DETACHING:
@@ -944,7 +999,9 @@ class IntentCoordinator(Node):
         msg.formation_type    = self._formation_type
         msg.drone_spacing     = self._drone_spacing
         msg.target_yaw        = self._target_yaw
-        msg.target_pos        = self._target_pos
+        # Lider drone'un formation offset'ini kompanse et
+        # Böylece centroid hedefe gittiğinde lider drone QR'ın tam üstünde olur
+        msg.target_pos        = self._compensate_leader_offset(self._target_pos)
         msg.drone_altitude    = self._drone_altitude
         msg.detach_drone_id   = self._detach_drone_id
         msg.zone_color        = self._zone_color
@@ -952,7 +1009,7 @@ class IntentCoordinator(Node):
         msg.maneuver_pitch_deg = self._maneuver_pitch
         msg.maneuver_roll_deg  = self._maneuver_roll
         msg.join_drone_id     = self._join_drone_id
-        msg.qr_seq            = self._last_qr_seq
+        msg.qr_seq            = self._current_qr_id
         msg.active_drone_count = self._get_active_drone_count()
 
         return msg

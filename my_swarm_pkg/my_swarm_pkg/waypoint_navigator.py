@@ -84,12 +84,12 @@ CTRL_HZ: float = 10.0
 CTRL_DT: float = 1.0 / CTRL_HZ
 
 # Waypoint yaklaşma mesafeleri
-LOITER_RADIUS_M: float  = 5.0   # Bu mesafede loiter başlar (QR okuma)
+LOITER_RADIUS_M: float  = 3.0   # Bu mesafede loiter başlar (QR okuma)
 APPROACH_RADIUS_M: float = 20.0  # Bu mesafede "yaklaşma" moduna gir (log/debug)
 HOME_LOITER_M: float    = 3.0   # Eve bu kadar yakınken hover et
 
 # Varsayılan loiter süresi (QRResult.wait_seconds gelmezse)
-DEFAULT_LOITER_S: float = 3.0
+DEFAULT_LOITER_S: float = 120.0  # QR okunana kadar bekle (QRResult gelince override edilir)
 
 # QR trigger cooldown: bir QR'ı tekrar tetikleme süresi
 QR_TRIGGER_COOLDOWN_S: float = 10.0
@@ -309,14 +309,18 @@ class WaypointNavigatorNode(Node):
 
     def _on_qr_result(self, msg: QRResult) -> None:
         """
-        QR okundu — bekleme süresini güncelle.
-        LOITERING fazındaki bekleme süresini QR'dan gelen değere çek.
+        QR okundu — bekleme süresini QR'dan gelen değere ayarla ve
+        loiter başlangıcını şimdiye çek (böylece wait_seconds sonra devam eder).
         """
-        if msg.wait_seconds > 0:
-            self._loiter_duration_s = float(msg.wait_seconds)
-            self.get_logger().info(
-                f'QR#{msg.qr_id} bekleme süresi: {msg.wait_seconds:.1f}s'
-            )
+        wait = float(msg.wait_seconds) if msg.wait_seconds > 0 else 3.0
+        self._loiter_duration_s = wait
+        # Loiter başlangıcını şimdiye çek — wait_seconds sonra devam edecek
+        self._loiter_start_time = time.time()
+        self._nav_phase = NavPhase.WAITING
+        self.get_logger().info(
+            f'✅ QR#{msg.qr_id} KAMERADAN OKUNDU! '
+            f'Bekleme: {wait:.1f}s sonra devam edecek'
+        )
 
     def _on_own_pose(self, msg: PoseStamped) -> None:
         p = msg.pose.position
@@ -352,7 +356,7 @@ class WaypointNavigatorNode(Node):
                 continue
             # Durum filtresi
             state = self._neighbor_states.get(uid, '')
-            if state not in ('FLYING', 'DETACH', 'REJOIN', 'LAND_ZONE',
+            if state not in ('TAKING_OFF', 'FLYING', 'DETACH', 'REJOIN', 'LAND_ZONE',
                              'RETURN_HOME'):
                 continue
             xs.append(pose[0])

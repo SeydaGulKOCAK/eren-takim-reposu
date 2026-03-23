@@ -1,73 +1,14 @@
 #!/usr/bin/env python3
 """
-╔══════════════════════════════════════════════════════════════════════════════╗
-║                      collision_avoidance.py  v1                             ║
-║           Çarpışma Kaçınma — APF (Artificial Potential Field)               ║
-╚══════════════════════════════════════════════════════════════════════════════╝
+collision_avoidance.py  v3 — ORCA (van den Berg et al., 2011)
+RVO2 referans implementasyonundan (github.com/snape/RVO2) birebir port.
 
-GENEL AÇIKLAMA:
----------------
-Bu node, formation_controller'ın ürettiği ham setpoint'i (setpoint_raw) alır,
-komşu drone'ların konumlarına bakarak APF (Yapay Potansiyel Alan) uygular ve
-nihai setpoint'i (setpoint_final) drone_interface'e iletir.
+ORCA: Hiz uzayinda calisir. Her komsu icin yari-duzlem (half-plane) hesaplar,
+LP (Linear Program) ile en yakin guvenli hizi bulur.
+Matematiksel carpisma-onleme garantisi verir.
 
-Yapay Potansiyel Alan (APF):
-  ┌─────────────────────────────────────────────────────────┐
-  │  F_toplam = F_itici (komşulardan kaç) + F_raw (hedefe git) │
-  │                                                         │
-  │  F_itici: her FLYING komşu için:                        │
-  │    d = kendi konum ↔ komşu konum                        │
-  │    d < R_MAX → itici kuvvet aktif                       │
-  │    F_j = K_REP * (1/d - 1/R_MAX) / d² * yön_vektörü    │
-  │                                                         │
-  │  F_raw : setpoint_raw'a çekici kuvvet (zaten setpoint)  │
-  │          → correction = setpoint_raw + clip(F_itici)    │
-  └─────────────────────────────────────────────────────────┘
-
-VERİ AKIŞI:
------------
-  formation_controller → /{ns}/setpoint_raw ──┐
-  /drone{i}/pose (tüm komşular) ──────────────┤
-  /drone{i}/local_state (FLYING filtre) ──────┼──► collision_avoidance (50Hz)
-  /drone{i}/velocity (TTC için) ──────────────┤        │
-  /swarm/intent (detach ID) ──────────────────┘        │
-                                                        ├──► /{ns}/setpoint_final
-                                                        └──► /safety/event
-
-OSİLASYON TESPİTİ:
-------------------
-  Son OSC_WINDOW adımın (0.4s @ 50Hz) setpoint varyansı OSC_THRESH_M'yi
-  aşarsa OSCILLATION SafetyEvent yayınlanır.
-  → formation_controller bu event'i alınca slew rate düşürür (dampening)
-  → OSC_COOLDOWN_S süresi boyunca tekrar tetiklenmez
-
-TTC (Time-To-Collision) KATEGORİ AĞIRLIKLANDIRMA:
---------------------------------------------------
-  d < R_DANGER : TTC < 1.5s → itici kuvvet 3x amplify
-  Bu sayede hızlı yaklaşan drone'lar daha sert itilir.
-
-BYPASS MODU:
-------------
-  FLYING komşu yoksa (kalkış öncesi / son drone) CA direkt pass-through yapar.
-  → setpoint_raw → setpoint_final (sıfır gecikme)
-
-PARAMETRE ÖZETI:
-----------------
-  R_MAX          = 8.0 m   — etki başlangıç mesafesi
-  R_MIN          = 3.0 m   — tehlike mesafesi (tam kuvvet)
-  K_REP          = 18.0    — itici kazanç (6m nominal spacing için kalibre)
-  MAX_CORR_M     = 3.0 m   — max APF düzeltme büyüklüğü (clip)
-  TTC_THRESHOLD  = 1.5 s   — TTC sınırı (altında → kuvvet 3x)
-  OSC_WINDOW     = 20      — osilasyon penceresi (adım sayısı, 0.4s)
-  OSC_THRESH_M   = 0.08 m  — osilasyon varyans eşiği
-  OSC_COOLDOWN_S = 5.0 s   — osilasyon event'i tekrar tetikleme süresi
-
-ŞARTNAME UYUMU:
-  §5.4  Çarpışma kaçınma     → APF tabanlı reaktif kaçınma ✅
-  §5.3  Dağıtık mimari       → Her drone kendi CA'sını çalıştırır ✅
-  §5.5  Güvenlik kriterleri  → Osilasyon tespiti + SafetyEvent ✅
-  Ceza  Çarpışma (-50 puan)  → R_MIN=3m tampon mesafesi ✅
-  Ceza  Osilasyon (-10 puan) → Dampening sinyali yayınlanır ✅
+Pipeline (degismedi):
+  setpoint_raw -> collision_avoidance (ORCA 50Hz) -> setpoint_final -> drone_interface
 """
 
 import math
@@ -81,97 +22,278 @@ from rclpy.qos import (
     QoSProfile,
     QoSReliabilityPolicy,
     QoSHistoryPolicy,
-    QoSDurabilityPolicy,
 )
 from geometry_msgs.msg import PoseStamped, TwistStamped
 from std_msgs.msg import Header
 from swarm_msgs.msg import LocalState, SwarmIntent, SafetyEvent
 
-# ══════════════════════════════════════════════════════════════════════════════
-# APF PARAMETRELERİ — tüm değerler simülasyon testi sonucu kalibre edilmiştir
-# ══════════════════════════════════════════════════════════════════════════════
-R_MAX: float = 4.5    # [m] — itici kuvvetin etki alanı başlangıcı (5m spacing altında devreye girer)
-R_MIN: float = 3.0    # [m] — tehlike bölgesi (tam amplify kuvvet)
-K_REP: float = 18.0   # [—] — itici potansiyel kazanç katsayısı
-MAX_CORR_M: float = 3.0   # [m] — APF düzeltme vektörünün clip sınırı (güvenlik)
-TTC_THRESHOLD: float = 1.5  # [s] — bu TTC altındaysa kuvvet 3x artır
-TTC_AMPLIFY: float = 3.0    # [—] — TTC aşımında kuvvet çarpanı
+# ============================================================================
+# PARAMETRELER
+# ============================================================================
+AGENT_RADIUS: float = 2.3    # [m] guvenlik yaricapi (combined=4.6m < 5m formasyon)
+TAU: float = 8.0              # [s] zaman ufku — 8sn ileriye bak
+MAX_SPEED: float = 1.5        # [m/s] max hiz — yavas ve guvenli
+LOOKAHEAD: float = 1.5        # [s] setpoint = own_pos + v_safe * LOOKAHEAD
+HARD_SAFETY_DIST: float = 4.0 # [m] bu mesafe altinda acil kac
+SLOWDOWN_DIST: float = 10.0   # [m] bu mesafe altinda hiz azaltmaya basla
 
-CTRL_HZ: float = 50.0       # [Hz] — kontrol döngü frekansı
+CTRL_HZ: float = 50.0
 CTRL_DT: float = 1.0 / CTRL_HZ
 
-# Osilasyon tespiti
-OSC_WINDOW: int = 20         # Son kaç adıma bak (0.4s @ 50Hz)
-OSC_THRESH_M: float = 4.00   # [m] — setpoint std sapması eşiği (2m → 4m: formasyon hareketi false positive önleme)
-OSC_COOLDOWN_S: float = 5.0  # [s] — aynı drone'dan iki event arası min bekleme
+OSC_WINDOW: int = 20
+OSC_THRESH_M: float = 4.0
+OSC_COOLDOWN_S: float = 5.0
 
-# Setpoint geçerliliği
-SP_STALE_S: float = 0.5      # [s] — bu kadar eski setpoint_raw → pass-through
-POSE_STALE_S: float = 1.0    # [s] — bu kadar eski komşu pose → görmezden gel
+SP_STALE_S: float = 0.5
+POSE_STALE_S: float = 1.0
 
 SWARM_SIZE: int = int(os.environ.get('SWARM_SIZE', '3'))
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# YARDIMCI FONKSİYONLAR
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _dist3(a: tuple[float, float, float],
-           b: tuple[float, float, float]) -> float:
-    """İki 3D nokta arası Öklid mesafesi."""
-    return math.sqrt(
-        (a[0] - b[0]) ** 2 +
-        (a[1] - b[1]) ** 2 +
-        (a[2] - b[2]) ** 2
-    )
+RVO_EPSILON: float = 1e-5
 
 
-def _unit_vec(frm: tuple[float, float, float],
-              to: tuple[float, float, float]) -> tuple[float, float, float]:
-    """frm → to yönündeki birim vektör. Sıfır vektörde (0,0,0) döner."""
-    dx, dy, dz = to[0] - frm[0], to[1] - frm[1], to[2] - frm[2]
-    mag = math.sqrt(dx * dx + dy * dy + dz * dz)
-    if mag < 1e-9:
-        return (0.0, 0.0, 0.0)
-    return (dx / mag, dy / mag, dz / mag)
+# ============================================================================
+# 2D VEKTOR YARDIMCILARI
+# ============================================================================
 
+def _dot(a, b):
+    return a[0] * b[0] + a[1] * b[1]
 
-def _clip_vec(v: tuple[float, float, float],
-              max_mag: float) -> tuple[float, float, float]:
-    """Vektörü max_mag büyüklüğüne kırp (yönü koru)."""
-    mag = math.sqrt(v[0] ** 2 + v[1] ** 2 + v[2] ** 2)
-    if mag <= max_mag or mag < 1e-9:
-        return v
-    scale = max_mag / mag
-    return (v[0] * scale, v[1] * scale, v[2] * scale)
+def _det(a, b):
+    """2D cross product (determinant)."""
+    return a[0] * b[1] - a[1] * b[0]
 
+def _abs_sq(v):
+    return v[0] * v[0] + v[1] * v[1]
 
-def _variance(vals: list[float]) -> float:
-    """Skaler bir liste üzerinde varyans hesapla."""
+def _length(v):
+    return math.sqrt(v[0] * v[0] + v[1] * v[1])
+
+def _normalize(v):
+    l = _length(v)
+    if l < RVO_EPSILON:
+        return (0.0, 0.0)
+    return (v[0] / l, v[1] / l)
+
+def _sub(a, b):
+    return (a[0] - b[0], a[1] - b[1])
+
+def _add(a, b):
+    return (a[0] + b[0], a[1] + b[1])
+
+def _scale(v, s):
+    return (v[0] * s, v[1] * s)
+
+def _variance(vals):
     if len(vals) < 2:
         return 0.0
     mean = sum(vals) / len(vals)
     return sum((v - mean) ** 2 for v in vals) / len(vals)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ============================================================================
+# ORCA LINE: (point, direction) — direction = cizgi yonu (normal degil!)
+# ============================================================================
+
+def _linear_program_1(lines, line_no, radius, opt_velocity, direction_opt):
+    """
+    RVO2 linearProgram1: lines[line_no] uzerinde, onceki tum cizgileri
+    saglayan, opt_velocity'ye en yakin noktayi bul.
+    Returns (success, result).
+    """
+    dot_product = _dot(lines[line_no][0], lines[line_no][1])
+    discriminant = (dot_product * dot_product + radius * radius
+                    - _abs_sq(lines[line_no][0]))
+
+    if discriminant < 0.0:
+        return False, (0.0, 0.0)
+
+    sqrt_disc = math.sqrt(discriminant)
+    t_left = -dot_product - sqrt_disc
+    t_right = -dot_product + sqrt_disc
+
+    for i in range(line_no):
+        denominator = _det(lines[line_no][1], lines[i][1])
+        numerator = _det(lines[i][1], _sub(lines[line_no][0], lines[i][0]))
+
+        if abs(denominator) <= RVO_EPSILON:
+            if numerator < 0.0:
+                return False, (0.0, 0.0)
+            continue
+
+        t = numerator / denominator
+
+        if denominator >= 0.0:
+            t_right = min(t_right, t)
+        else:
+            t_left = max(t_left, t)
+
+        if t_left > t_right:
+            return False, (0.0, 0.0)
+
+    if direction_opt:
+        if _dot(opt_velocity, lines[line_no][1]) > 0.0:
+            result = _add(lines[line_no][0], _scale(lines[line_no][1], t_right))
+        else:
+            result = _add(lines[line_no][0], _scale(lines[line_no][1], t_left))
+    else:
+        t = _dot(lines[line_no][1], _sub(opt_velocity, lines[line_no][0]))
+        if t < t_left:
+            result = _add(lines[line_no][0], _scale(lines[line_no][1], t_left))
+        elif t > t_right:
+            result = _add(lines[line_no][0], _scale(lines[line_no][1], t_right))
+        else:
+            result = _add(lines[line_no][0], _scale(lines[line_no][1], t))
+
+    return True, result
+
+
+def _linear_program_2(lines, radius, opt_velocity, direction_opt):
+    """
+    RVO2 linearProgram2: Tum cizgileri saglayan, opt_velocity'ye en yakin hizi bul.
+    Returns (result, fail_line). fail_line == len(lines) ise basarili.
+    """
+    if direction_opt:
+        result = _scale(opt_velocity, radius)
+    elif _abs_sq(opt_velocity) > radius * radius:
+        result = _scale(_normalize(opt_velocity), radius)
+    else:
+        result = opt_velocity
+
+    for i in range(len(lines)):
+        # Bu cizgi ihlal ediliyor mu?
+        if _det(lines[i][1], _sub(lines[i][0], result)) > 0.0:
+            temp_result = result
+            success, result = _linear_program_1(
+                lines, i, radius, opt_velocity, direction_opt)
+            if not success:
+                result = temp_result
+                return result, i
+
+    return result, len(lines)
+
+
+def _linear_program_3(lines, begin_line, radius, result):
+    """
+    RVO2 linearProgram3: LP2 basarisiz olunca fallback.
+    Kisitlari projekte edip tekrar dener.
+    """
+    distance = 0.0
+
+    for i in range(begin_line, len(lines)):
+        if _det(lines[i][1], _sub(lines[i][0], result)) > distance:
+            proj_lines = []
+
+            for j in range(i):
+                determinant = _det(lines[i][1], lines[j][1])
+
+                if abs(determinant) <= RVO_EPSILON:
+                    if _dot(lines[i][1], lines[j][1]) > 0.0:
+                        continue
+                    point = _scale(_add(lines[i][0], lines[j][0]), 0.5)
+                else:
+                    point = _add(
+                        lines[i][0],
+                        _scale(
+                            lines[i][1],
+                            _det(lines[j][1],
+                                 _sub(lines[i][0], lines[j][0])) / determinant
+                        )
+                    )
+
+                direction = _normalize(_sub(lines[j][1], lines[i][1]))
+                proj_lines.append((point, direction))
+
+            temp_result = result
+            dir_for_opt = (-lines[i][1][1], lines[i][1][0])
+            result, fail = _linear_program_2(
+                proj_lines, radius, dir_for_opt, True)
+
+            if fail < len(proj_lines):
+                result = temp_result
+
+            distance = _det(lines[i][1], _sub(lines[i][0], result))
+
+    return result
+
+
+# ============================================================================
+# ORCA CIZGISI HESABI — RVO2 computeNewVelocity'den birebir port
+# ============================================================================
+
+def _compute_orca_line(own_vel, rel_pos, rel_vel, combined_radius,
+                       inv_tau, inv_dt):
+    """
+    Tek bir komsu icin ORCA cizgisi hesapla.
+    RVO2 Agent::computeNewVelocity fonksiyonundaki agent ORCA lines kismi.
+
+    Returns: (point, direction) — ORCA cizgisi
+    """
+    dist_sq = _abs_sq(rel_pos)
+    combined_r_sq = combined_radius * combined_radius
+
+    if dist_sq > combined_r_sq:
+        # Henuz carpisma yok
+        w = _sub(rel_vel, _scale(rel_pos, inv_tau))
+        w_len_sq = _abs_sq(w)
+        dot_pw = _dot(w, rel_pos)
+
+        if dot_pw < 0.0 and dot_pw * dot_pw > combined_r_sq * w_len_sq:
+            # Cutoff dairesi uzerine projeksiyon
+            w_len = math.sqrt(w_len_sq)
+            if w_len < RVO_EPSILON:
+                unit_w = (1.0, 0.0)
+            else:
+                unit_w = (w[0] / w_len, w[1] / w_len)
+            direction = (unit_w[1], -unit_w[0])
+            u = _scale(unit_w, combined_radius * inv_tau - w_len)
+        else:
+            # Koni bacagi uzerine projeksiyon
+            leg = math.sqrt(max(0.0, dist_sq - combined_r_sq))
+
+            if _det(rel_pos, w) > 0.0:
+                # Sol bacak
+                direction = (
+                    (rel_pos[0] * leg - rel_pos[1] * combined_radius) / dist_sq,
+                    (rel_pos[0] * combined_radius + rel_pos[1] * leg) / dist_sq
+                )
+            else:
+                # Sag bacak (negatif)
+                direction = (
+                    -(rel_pos[0] * leg + rel_pos[1] * combined_radius) / dist_sq,
+                    -(-rel_pos[0] * combined_radius + rel_pos[1] * leg) / dist_sq
+                )
+
+            dot_rv_dir = _dot(rel_vel, direction)
+            u = _sub(_scale(direction, dot_rv_dir), rel_vel)
+    else:
+        # Zaten cakisiyor — acil ayirma
+        w = _sub(rel_vel, _scale(rel_pos, inv_dt))
+        w_len = _length(w)
+
+        if w_len < RVO_EPSILON:
+            unit_w = (1.0, 0.0)
+        else:
+            unit_w = (w[0] / w_len, w[1] / w_len)
+
+        direction = (unit_w[1], -unit_w[0])
+        u = _scale(unit_w, combined_radius * inv_dt - w_len)
+
+    # ORCA cizgisi: point = own_vel + u/2 (reciprocal: yarim sorumluluk)
+    point = _add(own_vel, _scale(u, 0.5))
+    return (point, direction)
+
+
+# ============================================================================
 # ANA NODE
-# ══════════════════════════════════════════════════════════════════════════════
+# ============================================================================
 
 class CollisionAvoidanceNode(Node):
-    """
-    APF tabanlı çarpışma kaçınma node'u.
-
-    Her drone kendi instance'ını çalıştırır; komşuların pozisyonlarını
-    subscribe ederek itici kuvvetleri hesaplar ve setpoint'i düzeltir.
-    """
 
     def __init__(self):
-        # ── Namespace / ID çözümleme ──────────────────────────────────────────
-        #   Beklenen env: DRONE_NS=drone1, DRONE_ID=1, SWARM_SIZE=3
-        self.ns: str = os.environ.get('DRONE_NS', 'drone1')
-        self.drone_id: int = int(os.environ.get('DRONE_ID', '1'))
-        self.swarm_size: int = SWARM_SIZE
+        self.ns = os.environ.get('DRONE_NS', 'drone1')
+        self.drone_id = int(os.environ.get('DRONE_ID', '1'))
+        self.swarm_size = SWARM_SIZE
 
         super().__init__(
             f'collision_avoidance_{self.drone_id}',
@@ -179,295 +301,127 @@ class CollisionAvoidanceNode(Node):
         )
 
         self.get_logger().info(
-            f'CollisionAvoidance başladı — ns={self.ns}, id={self.drone_id}, '
-            f'swarm_size={self.swarm_size}'
+            f'CollisionAvoidance ORCA v3 basladi — ns={self.ns}, '
+            f'id={self.drone_id}, swarm={self.swarm_size}'
         )
 
-        # ── Dahili durum ──────────────────────────────────────────────────────
-        self._own_pose: tuple[float, float, float] | None = None
-        self._own_pose_time: float = 0.0
+        # Dahili durum
+        self._own_pose = None
+        self._own_pose_time = 0.0
+        self._own_vel = (0.0, 0.0, 0.0)
+        self._setpoint_raw = None
+        self._sp_raw_time = 0.0
 
-        self._own_vel: tuple[float, float, float] = (0.0, 0.0, 0.0)
+        self._neighbor_poses = {}
+        self._neighbor_pose_times = {}
+        self._neighbor_vels = {}
+        self._neighbor_states = {}
+        self._detach_drone_id = 0
 
-        self._setpoint_raw: tuple[float, float, float] | None = None
-        self._sp_raw_time: float = 0.0
+        # Osilasyon tespiti
+        self._sp_hist_x = deque(maxlen=OSC_WINDOW)
+        self._sp_hist_y = deque(maxlen=OSC_WINDOW)
+        self._last_osc_event_time = 0.0
+        self._last_sp_final = None
 
-        # drone_id → (x, y, z)
-        self._neighbor_poses: dict[int, tuple[float, float, float]] = {}
-        self._neighbor_pose_times: dict[int, float] = {}
+        # Debug
+        self._dbg_closest_dist = float('inf')
+        self._dbg_active = 0
 
-        # drone_id → (vx, vy, vz)
-        self._neighbor_vels: dict[int, tuple[float, float, float]] = {}
-
-        # drone_id → state string
-        self._neighbor_states: dict[int, str] = {}
-
-        # detach drone: CA hâlâ kaçınır ama daha düşük kuvvetle
-        self._detach_drone_id: int = 0
-
-        # Osilasyon tespiti: son OSC_WINDOW adımın setpoint_final X/Y
-        self._sp_hist_x: deque[float] = deque(maxlen=OSC_WINDOW)
-        self._sp_hist_y: deque[float] = deque(maxlen=OSC_WINDOW)
-        self._last_osc_event_time: float = 0.0
-
-        # Son yayınlanan setpoint (stale guard için)
-        self._last_sp_final: tuple[float, float, float] | None = None
-
-        # Geçen çevrim için debug istatistikleri
-        self._dbg_closest_dist: float = float('inf')
-        self._dbg_corr_mag: float = 0.0
-        self._dbg_active_neighbors: int = 0
-
-        # ── QoS profilleri ────────────────────────────────────────────────────
-        best_effort_qos = QoSProfile(
+        # QoS
+        be_qos = QoSProfile(
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
-            history=QoSHistoryPolicy.KEEP_LAST,
-            depth=1,
-        )
-        reliable_qos = QoSProfile(
+            history=QoSHistoryPolicy.KEEP_LAST, depth=1)
+        rel_qos = QoSProfile(
             reliability=QoSReliabilityPolicy.RELIABLE,
-            history=QoSHistoryPolicy.KEEP_LAST,
-            depth=10,
-        )
+            history=QoSHistoryPolicy.KEEP_LAST, depth=10)
 
-        # ── Abonelikler ───────────────────────────────────────────────────────
-
-        # 1) Kendi ham setpoint'i (formation_controller'dan)
+        # Abonelikler
         self.create_subscription(
-            PoseStamped,
-            f'/{self.ns}/setpoint_raw',
-            self._on_setpoint_raw,
-            10,
-        )
-
-        # 2) Kendi konum + hız (drone_interface'den)
+            PoseStamped, f'/{self.ns}/setpoint_raw',
+            self._on_sp_raw, 10)
         self.create_subscription(
-            PoseStamped,
-            f'/{self.ns}/pose',
-            self._on_own_pose,
-            best_effort_qos,
-        )
+            PoseStamped, f'/{self.ns}/pose',
+            self._on_own_pose, be_qos)
         self.create_subscription(
-            TwistStamped,
-            f'/{self.ns}/velocity',
-            self._on_own_vel,
-            best_effort_qos,
-        )
+            TwistStamped, f'/{self.ns}/velocity',
+            self._on_own_vel, be_qos)
 
-        # 3) Komşu konumları + hızları + durumları
         for i in range(1, self.swarm_size + 1):
             if i == self.drone_id:
-                continue  # kendini izleme
+                continue
+            self.create_subscription(
+                PoseStamped, f'/drone{i}/pose',
+                lambda m, u=i: self._on_n_pose(m, u), be_qos)
+            self.create_subscription(
+                TwistStamped, f'/drone{i}/velocity',
+                lambda m, u=i: self._on_n_vel(m, u), be_qos)
+            self.create_subscription(
+                LocalState, f'/drone{i}/local_state',
+                lambda m, u=i: self._on_n_state(m, u), be_qos)
 
-            self.create_subscription(
-                PoseStamped,
-                f'/drone{i}/pose',
-                lambda msg, uid=i: self._on_neighbor_pose(msg, uid),
-                best_effort_qos,
-            )
-            self.create_subscription(
-                TwistStamped,
-                f'/drone{i}/velocity',
-                lambda msg, uid=i: self._on_neighbor_vel(msg, uid),
-                best_effort_qos,
-            )
-            self.create_subscription(
-                LocalState,
-                f'/drone{i}/local_state',
-                lambda msg, uid=i: self._on_neighbor_state(msg, uid),
-                best_effort_qos,  # local_fsm BEST_EFFORT yayınlar
-            )
-
-        # 4) Sürü niyeti (detach_drone_id için)
         self.create_subscription(
-            SwarmIntent,
-            '/swarm/intent',
-            self._on_intent,
-            10,
-        )
+            SwarmIntent, '/swarm/intent', self._on_intent, 10)
 
-        # ── Yayıncılar ────────────────────────────────────────────────────────
+        # Yayincilar
+        self._pub_final = self.create_publisher(
+            PoseStamped, f'/{self.ns}/setpoint_final', 10)
+        self._pub_safety = self.create_publisher(
+            SafetyEvent, '/safety/event', rel_qos)
 
-        # Nihai setpoint → drone_interface
-        self._sp_final_pub = self.create_publisher(
-            PoseStamped,
-            f'/{self.ns}/setpoint_final',
-            10,
-        )
-
-        # Güvenlik olayı → formation_controller + local_fsm
-        self._safety_pub = self.create_publisher(
-            SafetyEvent,
-            '/safety/event',
-            reliable_qos,
-        )
-
-        # ── 50 Hz kontrol döngüsü ─────────────────────────────────────────────
         self.create_timer(CTRL_DT, self._control_loop)
 
         self.get_logger().info(
-            f'APF parametreleri: R_MAX={R_MAX}m, R_MIN={R_MIN}m, '
-            f'K_REP={K_REP}, MAX_CORR={MAX_CORR_M}m'
-        )
+            f'ORCA params: R={AGENT_RADIUS}m TAU={TAU}s '
+            f'MAX_SPD={MAX_SPEED}m/s LOOK={LOOKAHEAD}s')
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # CALLBACK'LER
-    # ══════════════════════════════════════════════════════════════════════════
+    # === Callback'ler ========================================================
 
-    def _on_setpoint_raw(self, msg: PoseStamped) -> None:
-        """formation_controller'dan gelen ham setpoint."""
-        p = msg.pose.position
+    def _on_sp_raw(self, m):
+        p = m.pose.position
         self._setpoint_raw = (p.x, p.y, p.z)
         self._sp_raw_time = time.time()
 
-    def _on_own_pose(self, msg: PoseStamped) -> None:
-        """Kendi mevcut konumu (ENU, metre)."""
-        p = msg.pose.position
+    def _on_own_pose(self, m):
+        p = m.pose.position
         self._own_pose = (p.x, p.y, p.z)
         self._own_pose_time = time.time()
 
-    def _on_own_vel(self, msg: TwistStamped) -> None:
-        """Kendi mevcut hızı (ENU, m/s)."""
-        v = msg.twist.linear
+    def _on_own_vel(self, m):
+        v = m.twist.linear
         self._own_vel = (v.x, v.y, v.z)
 
-    def _on_neighbor_pose(self, msg: PoseStamped, uid: int) -> None:
-        """Komşu drone konumu."""
-        p = msg.pose.position
+    def _on_n_pose(self, m, uid):
+        p = m.pose.position
         self._neighbor_poses[uid] = (p.x, p.y, p.z)
         self._neighbor_pose_times[uid] = time.time()
 
-    def _on_neighbor_vel(self, msg: TwistStamped, uid: int) -> None:
-        """Komşu drone hızı (TTC hesabı için)."""
-        v = msg.twist.linear
+    def _on_n_vel(self, m, uid):
+        v = m.twist.linear
         self._neighbor_vels[uid] = (v.x, v.y, v.z)
 
-    def _on_neighbor_state(self, msg: LocalState, uid: int) -> None:
-        """Komşu drone durum makinesi durumu."""
-        self._neighbor_states[uid] = msg.state
+    def _on_n_state(self, m, uid):
+        self._neighbor_states[uid] = m.state
 
-    def _on_intent(self, msg: SwarmIntent) -> None:
-        """Sürü niyeti: detach drone ID'si."""
-        self._detach_drone_id = int(msg.detach_drone_id)
+    def _on_intent(self, m):
+        self._detach_drone_id = int(m.detach_drone_id)
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # APF HESABI
-    # ══════════════════════════════════════════════════════════════════════════
+    # === Osilasyon Tespiti ===================================================
 
-    def _compute_repulsive_force(
-        self,
-        own_pos: tuple[float, float, float],
-    ) -> tuple[float, float, float]:
-        """
-        Tüm FLYING komşular için itici APF kuvvetini hesapla.
-
-        Standart APF formülü (Khatib 1986):
-            F_rep = K * (1/d - 1/R_MAX) * (1/d²) * ∇d
-
-        Toplam vektörü döndürür: (fx, fy, fz) [metre biriminde düzeltme]
-        """
-        fx, fy, fz = 0.0, 0.0, 0.0
-        now = time.time()
-
-        active_count = 0
-        closest_dist = float('inf')
-
-        for uid, npos in self._neighbor_poses.items():
-            # ── Stale kontrol ──────────────────────────────────────────────────
-            if now - self._neighbor_pose_times.get(uid, 0.0) > POSE_STALE_S:
-                continue
-
-            # ── Sadece FLYING (veya DETACH, REJOIN) olan komşuları dikkate al ─
-            state = self._neighbor_states.get(uid, '')
-            if state not in ('FLYING', 'DETACH', 'REJOIN', 'LAND_ZONE'):
-                continue
-
-            d = _dist3(own_pos, npos)
-            if d < 0.05:
-                # Aynı nokta — teoride olmamalı, ama güvenlik için
-                d = 0.05
-
-            closest_dist = min(closest_dist, d)
-
-            if d >= R_MAX:
-                continue  # Etki alanı dışında
-
-            active_count += 1
-
-            # ── APF itici büyüklük ────────────────────────────────────────────
-            magnitude = K_REP * (1.0 / d - 1.0 / R_MAX) / (d * d)
-
-            # ── TTC (Time-To-Collision) amplifikasyon ────────────────────────
-            #   Komşunun bizim yönümüze hızla yaklaşıyorsa kuvveti artır
-            nvel = self._neighbor_vels.get(uid, (0.0, 0.0, 0.0))
-            rel_vx = self._own_vel[0] - nvel[0]
-            rel_vy = self._own_vel[1] - nvel[1]
-            rel_vz = self._own_vel[2] - nvel[2]
-            # Yaklaşma hızı: negatif → yaklaşıyor
-            toward_vec = _unit_vec(npos, own_pos)  # komşudan bize doğru
-            closing_speed = (
-                rel_vx * toward_vec[0] +
-                rel_vy * toward_vec[1] +
-                rel_vz * toward_vec[2]
-            )
-            # closing_speed pozitif → biz ondan uzaklaşıyoruz → TTC büyük → OK
-            # closing_speed negatif → yaklaşıyoruz
-            if closing_speed < -0.01:  # yaklaşıyoruz
-                ttc = d / abs(closing_speed)
-                if ttc < TTC_THRESHOLD:
-                    magnitude *= TTC_AMPLIFY
-
-            # ── Detach drone'a daha düşük kuvvet (sürüden ayrılıyor, normal) ─
-            if uid == self._detach_drone_id and self._detach_drone_id != 0:
-                magnitude *= 0.5
-
-            # ── Yön: komşudan bize (sadece XY — irtifa şartname gereği sabit) ─
-            away = _unit_vec(npos, own_pos)  # komşudan bize doğru
-            fx += magnitude * away[0]
-            fy += magnitude * away[1]
-            # fz: kasıtlı sıfır — tüm dronlar aynı irtifada uçar
-
-        # İstatistik güncelle
-        self._dbg_closest_dist = closest_dist
-        self._dbg_active_neighbors = active_count
-
-        return (fx, fy, fz)
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # OSİLASYON TESPİTİ
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def _check_oscillation(
-        self,
-        sp: tuple[float, float, float],
-    ) -> None:
-        """
-        Son OSC_WINDOW adımın setpoint X/Y standart sapmasına bak.
-        Eşiği aşarsa SafetyEvent(OSCILLATION) yayınla.
-        Cooldown süresi içinde tekrar tetiklenmez.
-        """
+    def _check_oscillation(self, sp):
         self._sp_hist_x.append(sp[0])
         self._sp_hist_y.append(sp[1])
-
-        if self._own_pose[2] < 3.0:
-            return  # Kalkış tamamlanmadı, osilasyon kontrolü yapma
-
-        if len(self._sp_hist_x) < OSC_WINDOW:
-            return  # Yeterli veri yok
-
+        if self._own_pose[2] < 3.0 or len(self._sp_hist_x) < OSC_WINDOW:
+            return
         var_x = _variance(list(self._sp_hist_x))
         var_y = _variance(list(self._sp_hist_y))
         std_xy = math.sqrt((var_x + var_y) / 2.0)
-
         if std_xy < OSC_THRESH_M:
             return
-
         now = time.time()
         if now - self._last_osc_event_time < OSC_COOLDOWN_S:
-            return  # Cooldown aktif
-
+            return
         self._last_osc_event_time = now
-
         evt = SafetyEvent()
         evt.header = Header()
         evt.header.stamp = self.get_clock().now().to_msg()
@@ -475,117 +429,168 @@ class CollisionAvoidanceNode(Node):
         evt.drone_id = self.drone_id
         evt.event_type = 'OSCILLATION'
         evt.description = (
-            f'drone{self.drone_id} APF osilasyon: '
-            f'std_xy={std_xy:.3f}m > eşik={OSC_THRESH_M}m'
-        )
+            f'drone{self.drone_id} osilasyon: std={std_xy:.3f}m')
         evt.severity = min(1.0, float(std_xy / (OSC_THRESH_M * 3.0)))
-        self._safety_pub.publish(evt)
+        self._pub_safety.publish(evt)
+        self.get_logger().warn(f'OSILASYON: std={std_xy:.3f}m')
 
-        self.get_logger().warn(
-            f'OSİLASYON TESPİT: std_xy={std_xy:.3f}m, '
-            f'severity={evt.severity:.2f} → /safety/event yayınlandı'
-        )
+    # === Ana Kontrol Dongusu — 50 Hz ========================================
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # ANA KONTROL DÖNGÜSÜ — 50 Hz
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def _control_loop(self) -> None:
-        """
-        50 Hz'de çalışır:
-          1) Veri tazeliği kontrol
-          2) APF hesabı
-          3) Osilasyon tespiti
-          4) setpoint_final yayınla
-        """
+    def _control_loop(self):
         now = time.time()
 
-        # ── 1) Temel veri kontrolü ────────────────────────────────────────────
         if self._setpoint_raw is None:
-            return  # Henüz setpoint gelmedi
-
-        sp_raw_age = now - self._sp_raw_time
-        if sp_raw_age > SP_STALE_S:
-            # Stale setpoint → son bilinen setpoint'i koru, yayın yapma
             return
-
+        if now - self._sp_raw_time > SP_STALE_S:
+            return
         if self._own_pose is None:
-            # Kendi konumunu bilmiyoruz → pass-through (CA kapalı)
-            self._publish_setpoint(self._setpoint_raw)
+            self._publish(self._setpoint_raw)
             return
 
         own_pos = self._own_pose
+        own_vel_2d = (self._own_vel[0], self._own_vel[1])
+        sp_raw = self._setpoint_raw
 
-        # ── 2) FLYING komşu var mı? ───────────────────────────────────────────
-        flying_neighbors = [
-            uid for uid, st in self._neighbor_states.items()
-            if st in ('FLYING', 'DETACH', 'REJOIN', 'LAND_ZONE')
-        ]
-        if not flying_neighbors:
-            # Bypass: komşu yok (yalnız uçuş veya kalkış öncesi)
-            self._publish_setpoint(self._setpoint_raw)
+        # Aktif komsu var mi?
+        active = [u for u, s in self._neighbor_states.items()
+                  if s not in ('DISARM_WAIT', 'LANDING', '')]
+        if not active:
+            self._publish(sp_raw)
             return
 
-        # ── 3) APF itici kuvvet ───────────────────────────────────────────────
-        rep_force = self._compute_repulsive_force(own_pos)
+        # Tercih edilen hiz: hedefe dogru
+        dx = sp_raw[0] - own_pos[0]
+        dy = sp_raw[1] - own_pos[1]
+        dist_to_tgt = math.sqrt(dx * dx + dy * dy)
 
-        # ── 4) Düzeltme clip ──────────────────────────────────────────────────
-        corr = _clip_vec(rep_force, MAX_CORR_M)
-        self._dbg_corr_mag = math.sqrt(
-            corr[0] ** 2 + corr[1] ** 2 + corr[2] ** 2
-        )
+        if dist_to_tgt > 0.1:
+            speed = min(MAX_SPEED, dist_to_tgt / LOOKAHEAD)
+            v_pref = (dx / dist_to_tgt * speed, dy / dist_to_tgt * speed)
+        else:
+            v_pref = (0.0, 0.0)
 
-        # ── 5) Nihai setpoint ─────────────────────────────────────────────────
-        sp_raw = self._setpoint_raw
-        sp_final: tuple[float, float, float] = (
-            sp_raw[0] + corr[0],
-            sp_raw[1] + corr[1],
-            sp_raw[2],  # Z sabit: tüm dronlar aynı irtifada (şartname gereği)
-        )
+        # ORCA cizgilerini hesapla
+        orca_lines = []
+        closest = float('inf')
+        act_count = 0
+        inv_tau = 1.0 / TAU
+        inv_dt = 1.0 / CTRL_DT
 
-        # ── 6) Osilasyon tespiti ──────────────────────────────────────────────
-        self._check_oscillation(sp_final)
+        for uid, npos in self._neighbor_poses.items():
+            if now - self._neighbor_pose_times.get(uid, 0.0) > POSE_STALE_S:
+                continue
+            state = self._neighbor_states.get(uid, '')
+            if state in ('DISARM_WAIT', 'LANDING'):
+                continue
 
-        # ── 7) Yayın ──────────────────────────────────────────────────────────
-        self._publish_setpoint(sp_final)
+            rel_pos = (npos[0] - own_pos[0], npos[1] - own_pos[1])
+            d = _length(rel_pos)
+            closest = min(closest, d)
+            act_count += 1
 
-        # ── 8) Periyodik debug log (5 sn'de bir) ─────────────────────────────
-        if int(now * 5) % 25 == 0 and (
-            self._dbg_closest_dist < R_MAX or self._dbg_corr_mag > 0.05
-        ):
-            self.get_logger().debug(
-                f'CA | yakın={self._dbg_closest_dist:.2f}m '
-                f'aktif={self._dbg_active_neighbors} '
-                f'|corr|={self._dbg_corr_mag:.3f}m '
-                f'sp_raw=({sp_raw[0]:.1f},{sp_raw[1]:.1f},{sp_raw[2]:.1f}) '
-                f'sp_fin=({sp_final[0]:.1f},{sp_final[1]:.1f},{sp_final[2]:.1f})'
+            nvel = self._neighbor_vels.get(uid, (0.0, 0.0, 0.0))
+            rel_vel = (self._own_vel[0] - nvel[0], self._own_vel[1] - nvel[1])
+
+            combined_r = 2.0 * AGENT_RADIUS
+            line = _compute_orca_line(
+                own_vel_2d, rel_pos, rel_vel, combined_r, inv_tau, inv_dt)
+            orca_lines.append(line)
+
+        self._dbg_closest_dist = closest
+        self._dbg_active = act_count
+
+        # LP coz: guvenli hiz bul
+        result, fail_line = _linear_program_2(
+            orca_lines, MAX_SPEED, v_pref, False)
+
+        if fail_line < len(orca_lines):
+            result = _linear_program_3(
+                orca_lines, fail_line, MAX_SPEED, result)
+
+        v_safe = result
+
+        # === HIZ SINIRLA — yakinlastikca yavaşla ===
+        # ArduPilot aninda duramaz. 4m/s'de frenleme ~4m.
+        # Cozum: mesafe azaldikca max hizi dusur.
+        #   8m  → 4.0 m/s (tam hiz)
+        #   4m  → 2.0 m/s
+        #   2m  → 1.0 m/s
+        if closest < SLOWDOWN_DIST:
+            max_allowed = MAX_SPEED * (closest / SLOWDOWN_DIST)
+            max_allowed = max(0.3, max_allowed)  # minimum 0.3 m/s
+            spd = _length(v_safe)
+            if spd > max_allowed:
+                v_safe = _scale(_normalize(v_safe), max_allowed)
+
+        # === HARD SAFETY KATMANI ===
+        # ORCA'nin ustune son savunma: mesafe < HARD_SAFETY_DIST ise
+        # setpoint'i dogrudan komsulardan UZAGA koy.
+        # ORCA hiz tabanli ama ArduPilot gecikme yapiyor → hard safety pozisyon tabanli.
+        if closest < HARD_SAFETY_DIST:
+            escape_x, escape_y = 0.0, 0.0
+            for uid, npos in self._neighbor_poses.items():
+                if now - self._neighbor_pose_times.get(uid, 0.0) > POSE_STALE_S:
+                    continue
+                state = self._neighbor_states.get(uid, '')
+                if state in ('DISARM_WAIT', 'LANDING'):
+                    continue
+                dx_n = own_pos[0] - npos[0]
+                dy_n = own_pos[1] - npos[1]
+                d_n = math.sqrt(dx_n * dx_n + dy_n * dy_n)
+                if d_n < HARD_SAFETY_DIST and d_n > 0.01:
+                    # Normalize + ters kare: yakinken cok guclu
+                    escape_x += (dx_n / d_n) / (d_n * d_n)
+                    escape_y += (dy_n / d_n) / (d_n * d_n)
+
+            esc_len = math.sqrt(escape_x * escape_x + escape_y * escape_y)
+            if esc_len > 0.01:
+                escape_x /= esc_len
+                escape_y /= esc_len
+
+            # Setpoint'i dogrudan uzaga koy (hiz hesabi degil, pozisyon!)
+            escape_dist = HARD_SAFETY_DIST
+            sp_final = (
+                own_pos[0] + escape_x * escape_dist,
+                own_pos[1] + escape_y * escape_dist,
+                sp_raw[2],
             )
+            self._check_oscillation(sp_final)
+            self._publish(sp_final)
+            self.get_logger().warn(
+                f'HARD SAFETY! d={closest:.2f}m → setpoint {escape_dist:.1f}m uzaga')
+            return
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # SETPOINT YAYINI
-    # ══════════════════════════════════════════════════════════════════════════
+        # Setpoint'e cevir
+        sp_final = (
+            own_pos[0] + v_safe[0] * LOOKAHEAD,
+            own_pos[1] + v_safe[1] * LOOKAHEAD,
+            sp_raw[2],
+        )
 
-    def _publish_setpoint(
-        self,
-        sp: tuple[float, float, float],
-    ) -> None:
-        """PoseStamped formatında setpoint_final yayınla."""
+        self._check_oscillation(sp_final)
+        self._publish(sp_final)
+
+        # Debug — her saniye log bas
+        if int(now) % 1 == 0 and int(now * CTRL_HZ) % int(CTRL_HZ) == 0:
+            self.get_logger().warn(
+                f'ORCA d={closest:.1f}m n={act_count} '
+                f'vpref=({v_pref[0]:.1f},{v_pref[1]:.1f}) '
+                f'vsafe=({v_safe[0]:.1f},{v_safe[1]:.1f}) '
+                f'states={dict(self._neighbor_states)}')
+
+    # === Setpoint Yayini =====================================================
+
+    def _publish(self, sp):
         msg = PoseStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = 'map'
-        msg.pose.position.x = sp[0]
-        msg.pose.position.y = sp[1]
-        msg.pose.position.z = sp[2]
-        # Orientation: kimlik quaternion (drone_interface MAVROS'a yönü ayrıca
-        # gönderdiğinden burada önemli değil)
+        msg.pose.position.x = float(sp[0])
+        msg.pose.position.y = float(sp[1])
+        msg.pose.position.z = float(sp[2])
         msg.pose.orientation.w = 1.0
-        self._sp_final_pub.publish(msg)
+        self._pub_final.publish(msg)
         self._last_sp_final = sp
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ENTRYPOINT
-# ══════════════════════════════════════════════════════════════════════════════
 
 def main(args=None):
     rclpy.init(args=args)
@@ -601,29 +606,3 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# MANUEL TEST (bağımsız çalıştırma)
-# ══════════════════════════════════════════════════════════════════════════════
-#
-# Terminal 1 — drone1 CA:
-#   DRONE_NS=drone1 DRONE_ID=1 SWARM_SIZE=3 \
-#   ros2 run my_swarm_pkg collision_avoidance
-#
-# Terminal 2 — sahte komşu konum (3m — tehlike bölgesi):
-#   ros2 topic pub /drone2/local_state swarm_msgs/msg/LocalState \
-#     '{drone_id: 2, state: "FLYING"}' &
-#   ros2 topic pub /drone2/pose geometry_msgs/msg/PoseStamped \
-#     '{pose: {position: {x: 3.0, y: 0.0, z: 20.0}}}' --rate 10 &
-#   ros2 topic pub /drone1/pose geometry_msgs/msg/PoseStamped \
-#     '{pose: {position: {x: 0.0, y: 0.0, z: 20.0}}}' --rate 10 &
-#   ros2 topic pub /drone1/setpoint_raw geometry_msgs/msg/PoseStamped \
-#     '{pose: {position: {x: 5.0, y: 0.0, z: 20.0}}}' --rate 10
-#
-# Terminal 3 — setpoint_final izle:
-#   ros2 topic echo /drone1/setpoint_final
-#   # Beklenen: x < 5.0 (APF geri itiyor)
-#
-# Terminal 4 — osilasyon testi:
-#   # setpoint_raw'ı hızla ±0.5m değiştir → /safety/event OSCILLATION beklenir

@@ -3,24 +3,26 @@
   <model name="qr_marker_4">
     <static>true</static>
     <link name="link">
-      <pose>0 0 0.005 0 0 0</pose>
+      <pose>0 0 0.06 0 0 0</pose>
       <collision name="collision">
         <geometry>
-          <box><size>1.2 1.2 0.01</size></box>
+          <box><size>1.2 1.2 0.05</size></box>
         </geometry>
       </collision>
       <visual name="visual">
         <geometry>
-          <box><size>1.2 1.2 0.01</size></box>
+          <box><size>1.2 1.2 0.05</size></box>
         </geometry>
         <material>
           <ambient>1 1 1 1</ambient>
           <diffuse>1 1 1 1</diffuse>
-          <specular>0.1 0.1 0.1 1</specular>
-          <emissive>0.2 0.2 0.2 1</emissive>
+          <specular>0 0 0 1</specular>
+          <emissive>0 0 0 0</emissive>
           <pbr>
             <metal>
               <albedo_map>model://qr_marker_4/materials/textures/qr_marker_4.png</albedo_map>
+              <roughness>1.0</roughness>
+              <metalness>0.0</metalness>
             </metal>
           </pbr>
         </material>

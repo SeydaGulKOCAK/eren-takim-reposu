@@ -72,11 +72,12 @@ import rclpy
 from rclpy.node import Node
 from rclpy.clock import Clock
 from rclpy.time import Time
+from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy, QoSHistoryPolicy
 
 from std_msgs.msg import String, Bool
 from geometry_msgs.msg import PoseStamped
 
-from swarm_msgs.msg import LocalState, SwarmIntent, JoinRequest, SafetyEvent
+from swarm_msgs.msg import LocalState, SwarmIntent, JoinRequest, SafetyEvent, ColorZoneList
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -86,6 +87,7 @@ from swarm_msgs.msg import LocalState, SwarmIntent, JoinRequest, SafetyEvent
 class State:
     STANDBY         = 'STANDBY'
     IDLE            = 'IDLE'
+    TAKING_OFF      = 'TAKING_OFF'
     FLYING          = 'FLYING'
     DETACH          = 'DETACH'
     LAND_ZONE       = 'LAND_ZONE'
@@ -180,15 +182,34 @@ class LocalFSM(Node):
 
         # ── KALKIŞ YÜKSEKLIĞI ─────────────────────────────────
         # İlk kalkışta ve REJOIN'da hedef irtifa
-        self._target_altitude: float = 5.0   # metre (intent'ten güncellenir)
+        self._target_altitude: float = 10.0   # metre (intent'ten güncellenir)
+
+        # ── DETACH / LAND_ZONE TAKİBİ ─────────────────────────
+        # Detach intent'ten gelen hedef iniş zone rengi ve pozisyonu
+        self._target_zone_color: str = ''
+        self._target_zone_pos: tuple | None = None  # (x, y, z) metre ENU
+        # Kendi konumumuz (drone_interface'ten)
+        self._own_pos: tuple | None = None   # (x, y, z) metre ENU
+
+        # Zone'a yaklaşma eşiği → DETACH → LAND_ZONE geçişi tetiklenir
+        self._ZONE_APPROACH_M: float = 3.0
+        # Yerde sayılma eşiği → LAND_ZONE → DISARM_WAIT geçişi tetiklenir
+        self._LAND_ALT_M: float = 0.5
 
         # ══════════════════════════════════════════════════════
         # PUBLISHER'LAR
         # ══════════════════════════════════════════════════════
 
         # 1) State yayınla → intent_coordinator ve swarm_comm okur
+        # VOLATILE: eski mesajlar yeni subscriber'lara iletilmesin (zombie state sorunu)
+        volatile_qos = QoSProfile(
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            durability=QoSDurabilityPolicy.VOLATILE,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=5,
+        )
         self.local_state_pub = self.create_publisher(
-            LocalState, f'/{self.ns}/local_state', 10
+            LocalState, f'/{self.ns}/local_state', volatile_qos
         )
 
         # 2) Mod komutu → drone_interface okur → Pixhawk'a iletir
@@ -239,6 +260,22 @@ class LocalFSM(Node):
             10
         )
 
+        # 4) Kendi konumu → DETACH zone yakınlık ve LAND_ZONE iniş tespiti için
+        self.create_subscription(
+            PoseStamped,
+            f'/{self.ns}/pose',
+            self._own_pose_cb,
+            10
+        )
+
+        # 5) Renk zone listesi → DETACH state'inde hedef zone pozisyonunu bul
+        self.create_subscription(
+            ColorZoneList,
+            '/perception/color_zones',
+            self._color_zones_cb,
+            10
+        )
+
         # ══════════════════════════════════════════════════════
         # PERİYODİK GÖREVLER (Timer)
         # ══════════════════════════════════════════════════════
@@ -258,6 +295,10 @@ class LocalFSM(Node):
         # STANDBY iken join_request gönder (2 Hz)
         # Çok sık göndermeye gerek yok, 2 Hz yeterli
         self.create_timer(0.5, self._publish_join_request_if_standby)
+
+        # DETACH → LAND_ZONE ve LAND_ZONE → DISARM_WAIT otomatik geçiş (10 Hz)
+        self.create_timer(0.1, self._check_landing_transitions)
+        self.create_timer(0.1, self._check_takeoff_complete)
 
         self.get_logger().info(
             f'✅ [{self.ns}] local_fsm HAZIR! İlk durum: {self._state}'
@@ -360,6 +401,13 @@ class LocalFSM(Node):
             # drone_id=0 → broadcast (tüm drone'ları etkiler)
             return
 
+        # OSCILLATION → SAFETY_HOLD tetikleme: formation_controller dampening yeterli
+        if msg.event_type == 'OSCILLATION':
+            self.get_logger().info(
+                f'[{self.ns}] ℹ️  OSCILLATION eventi yoksayıldı — formation_controller dampening aktif.'
+            )
+            return
+
         self.get_logger().warn(
             f'🚨 [{self.ns}] GÜVENLİK OLAYI! Tip: {msg.event_type} '
             f'| Açıklama: {msg.description}\n'
@@ -433,10 +481,10 @@ class LocalFSM(Node):
                 f'🚀 [{self.ns}] IDLE intent alındı, STANDBY → IDLE geçişi'
             )
             self._transition_to(State.IDLE)
+            # GUIDED moda al (ARM öncesi! STABILIZE'da arm → PILOT_OVERRIDE tetikler)
+            self._send_mode('GUIDED')
             # Drone'u ARM et (motorlar hazır)
             self._send_arm(True)
-            # GUIDED moda al (otonom uçuşa hazır)
-            self._send_mode('GUIDED')
 
     def _handle_navigate_intent(self, msg: SwarmIntent):
         """
@@ -447,12 +495,24 @@ class LocalFSM(Node):
           FLYING  → FLYING : Devam ediyor (zaten uçuyor)
           REJOIN  → FLYING : Sürüye katıldıktan sonra
         """
-        if self._state == State.IDLE:
+        if self._state == State.STANDBY:
+            # STANDBY → TAKING_OFF: GUIDED + ARM + kalkış
+            self.get_logger().info(
+                f'🛫 [{self.ns}] KALKIŞ! STANDBY → TAKING_OFF, irtifa: {msg.drone_altitude:.1f}m'
+            )
+            self._transition_to(State.TAKING_OFF)
+            self._send_mode('GUIDED')
+            self._send_arm(True)
+
+        elif self._state == State.IDLE:
             self.get_logger().info(
                 f'🛫 [{self.ns}] KALKIŞ! Hedef irtifa: {msg.drone_altitude:.1f}m'
             )
-            self._transition_to(State.FLYING)
+            self._transition_to(State.TAKING_OFF)
             self._send_mode('GUIDED')
+
+        elif self._state == State.TAKING_OFF:
+            pass  # Kalkış devam ediyor, irtifa kontrolü _check_takeoff_complete'de
 
         elif self._state == State.REJOIN:
             # Sürüye yeniden katıldık, artık FLYING sayılıyoruz
@@ -496,10 +556,10 @@ class LocalFSM(Node):
             f'   Sürüden ayrılıyorum, iniş bölgesine gidiyorum...'
         )
         self._pending_detach = True
+        self._target_zone_color = msg.zone_color  # zone pozisyonu _color_zones_cb'de bulunacak
+        self._target_zone_pos = None               # bir sonraki color_zones gelince dolar
         self._transition_to(State.DETACH)
         self._send_mode('GUIDED')
-        # formation_controller DETACH state'ini görünce bu drone'a
-        # zone koordinatını setpoint olarak verecek (zone_color'a göre)
 
     def _handle_rejoin_intent(self, msg: SwarmIntent):
         """
@@ -553,59 +613,126 @@ class LocalFSM(Node):
             pass
 
     # ══════════════════════════════════════════════════════════════════════
-    # STATE GEÇİŞ ÖTESİ OLAYLAR
-    # Dış trigger olmadan oluşan geçişler (örn: iniş tamamlandı)
+    # OTOMATİK GEÇIŞ CALLBACK'LERİ VE TIMER
     # ══════════════════════════════════════════════════════════════════════
 
-    def on_detach_arrived_at_zone(self):
-        """
-        Dışarıdan çağrılır: formation_controller bu drone'un zone
-        yakınında olduğunu tespit edince local_fsm'i bilgilendirir.
-        DETACH → LAND_ZONE geçişi.
+    def _own_pose_cb(self, msg: PoseStamped):
+        """Kendi konumumuzu takip et (zone yakınlık + iniş tespiti için)."""
+        p = msg.pose.position
+        self._own_pos = (p.x, p.y, p.z)
 
-        NOT: Şu an bu geçiş formation_controller entegre edilince
-        bir topic üzerinden tetiklenecek. Şimdilik placeholder.
+    def _color_zones_cb(self, msg: ColorZoneList):
         """
-        if self._state == State.DETACH:
+        qr_perception'dan gelen zone listesini tara.
+        DETACH state'indeyken hedef renkteki zone pozisyonunu güncelle.
+        """
+        if self._state != State.DETACH or not self._target_zone_color:
+            return
+        for zone in msg.zones:
+            if zone.color.upper() == self._target_zone_color.upper():
+                self._target_zone_pos = (zone.position.x, zone.position.y, zone.position.z)
+                return
+
+    def _check_takeoff_complete(self):
+        """
+        10 Hz — TAKING_OFF state'inde irtifa kontrolü.
+        Drone hedef irtifanın %50'sine ulaşınca hazır sinyali yayınlar.
+        Tüm drone'lar hazır olunca hepsi aynı anda FLYING'e geçer.
+        """
+        if self._state != State.TAKING_OFF:
+            return
+        if self._own_pos is None:
+            return
+        current_alt = self._own_pos[2]
+        threshold = self._target_altitude * 0.50
+        if current_alt >= threshold and not getattr(self, '_altitude_ready', False):
+            self._altitude_ready = True
             self.get_logger().info(
-                f'🎯 [{self.ns}] İniş bölgesine ulaşıldı! '
-                f'DETACH → LAND_ZONE (precision_landing aktif)'
+                f'✅ [{self.ns}] İrtifa hazır: {current_alt:.1f}m >= {threshold:.1f}m — FLYING sinyali yayınlanıyor'
             )
-            self._transition_to(State.LAND_ZONE)
-            # precision_landing artık landing_target topic'ini yayınlayacak
-            # drone_interface onu alıp Pixhawk'a iletecek
+            # Hazır sinyali yayınla — tüm drone'lar hazır olunca hepsi aynı anda FLYING
+            if not hasattr(self, '_sync_flying_pub'):
+                self._sync_flying_pub = self.create_publisher(Bool, '/swarm/sync_flying', 10)
+                self._sync_flying_ready = {}
+                _num = int(__import__('os').environ.get('SWARM_SIZE', '3'))
+                self._sync_flying_num = _num
+                for i in range(1, _num + 1):
+                    self.create_subscription(Bool, f'/swarm/drone{i}_flying_ready',
+                        lambda msg, uid=i: self._on_flying_ready(uid), 10)
+            msg = Bool()
+            msg.data = True
+            ready_pub = self.create_publisher(Bool, f'/swarm/drone{self.drone_id}_flying_ready', 10)
+            self.create_timer(0.05, lambda: ready_pub.publish(msg))
 
-    def on_landing_complete(self):
-        """
-        LAND_ZONE → DISARM_WAIT geçişi: İniş tamamlandı.
-        Drone yerde, DISARM bekleniyor.
-
-        NOT: drone_interface armed=False algıladığında veya
-        altitude < 0.3m olduğunda bu çağrılacak.
-        Şimdilik placeholder.
-        """
-        if self._state == State.LAND_ZONE:
+    def _on_flying_ready(self, uid: int):
+        if not hasattr(self, '_sync_flying_ready'):
+            return
+        self._sync_flying_ready[uid] = True
+        if len(self._sync_flying_ready) >= self._sync_flying_num and self._state == State.TAKING_OFF:
             self.get_logger().info(
-                f'✅ [{self.ns}] İniş tamamlandı! LAND_ZONE → DISARM_WAIT'
+                f'🚀 [{self.ns}] Tüm drone\'lar irtifada ({len(self._sync_flying_ready)}/{self._sync_flying_num}) — SENKRON FLYING!'
             )
-            self._transition_to(State.DISARM_WAIT)
-            # Drone'u DISARM et
-            self._send_arm(False)
-            self._send_mode('LAND')
-            self._waiting_for_join_signal = True
+            self._transition_to(State.FLYING)
 
+    def _check_landing_transitions(self):
+        """
+        10 Hz timer — iki otomatik geçişi kontrol eder:
+
+        1) DETACH → LAND_ZONE:
+           Kendi konumumuz hedef zone'a _ZONE_APPROACH_M'den yakınsa geçiş yap.
+
+        2) LAND_ZONE → DISARM_WAIT:
+           Yükseklik _LAND_ALT_M'nin altına düşünce iniş tamamdır.
+           LAND modu gönder + DISARM.
+        """
+        if self._own_pos is None:
+            return
+
+        # ── 1) DETACH → LAND_ZONE ────────────────────────────────────────
+        if self._state == State.DETACH and self._target_zone_pos is not None:
+            dx = self._own_pos[0] - self._target_zone_pos[0]
+            dy = self._own_pos[1] - self._target_zone_pos[1]
+            dist_2d = (dx * dx + dy * dy) ** 0.5
+            if dist_2d <= self._ZONE_APPROACH_M:
+                self.get_logger().info(
+                    f'🎯 [{self.ns}] İniş bölgesine ulaşıldı! '
+                    f'dist={dist_2d:.1f}m < {self._ZONE_APPROACH_M}m\n'
+                    f'   DETACH → LAND_ZONE'
+                )
+                self._transition_to(State.LAND_ZONE)
+                self._send_mode('LAND')
+
+        # ── 2) LAND_ZONE → DISARM_WAIT ───────────────────────────────────
+        elif self._state == State.LAND_ZONE:
+            alt = self._own_pos[2]
+            if alt <= self._LAND_ALT_M:
+                self.get_logger().info(
+                    f'✅ [{self.ns}] İniş tamamlandı! '
+                    f'alt={alt:.2f}m < {self._LAND_ALT_M}m\n'
+                    f'   LAND_ZONE → DISARM_WAIT'
+                )
+                self._transition_to(State.DISARM_WAIT)
+                self._send_arm(False)
+                self._waiting_for_join_signal = True
+
+        # ── 3) RETURN_HOME → LANDING ─────────────────────────────────────
         elif self._state == State.RETURN_HOME:
-            self.get_logger().info(
-                f'🏁 [{self.ns}] GÖREV TAMAMLANDI! RETURN_HOME → LANDING'
-            )
-            self._transition_to(State.LANDING)
-            self._send_mode('LAND')
+            alt = self._own_pos[2]
+            if alt <= self._LAND_ALT_M:
+                self.get_logger().info(
+                    f'🏁 [{self.ns}] GÖREV TAMAMLANDI! RETURN_HOME → LANDING'
+                )
+                self._transition_to(State.LANDING)
+                self._send_mode('LAND')
 
+        # ── 4) LANDING → DISARM ──────────────────────────────────────────
         elif self._state == State.LANDING:
-            self.get_logger().info(
-                f'🎉 [{self.ns}] TÜM GÖREVLER BİTTİ! DISARM ediliyor...'
-            )
-            self._send_arm(False)
+            alt = self._own_pos[2]
+            if alt <= self._LAND_ALT_M:
+                self.get_logger().info(
+                    f'🎉 [{self.ns}] TÜM GÖREVLER BİTTİ! DISARM ediliyor...'
+                )
+                self._send_arm(False)
 
     # ══════════════════════════════════════════════════════════════════════
     # YARDIMCI FONKSİYONLAR

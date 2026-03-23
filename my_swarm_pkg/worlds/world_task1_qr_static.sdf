@@ -117,17 +117,17 @@
 
     <include>
       <uri>model://Drone1</uri>
-      <pose degrees="true">7.33 0 0.195 0 0 90</pose>
+      <pose degrees="true">0 0 0.195 0 0 90</pose>
     </include>
 
     <include>
       <uri>model://Drone2</uri>
-      <pose degrees="true">2.33 -2.5 0.195 0 0 90</pose>
+      <pose degrees="true">0 -5 0.195 0 0 90</pose>
     </include>
 
     <include>
       <uri>model://Drone3</uri>
-      <pose degrees="true">2.33 2.5 0.195 0 0 90</pose>
+      <pose degrees="true">0 5 0.195 0 0 90</pose>
     </include>
 
     <!-- QR Markers: 6 adet — merkez (35,0) etrafında R=15 altıgen dizilim
@@ -168,6 +168,43 @@
       <uri>model://qr_marker_6</uri>
       <pose>42.5 -13.0 0 0 0 0</pose>
     </include>
+
+    <!-- Home Noktaları: drone başlangıç konumları — yeşil daire -->
+    <model name="home_drone1">
+      <static>true</static>
+      <pose>0 0 0 0 0 0</pose>
+      <link name="link">
+        <visual name="disc">
+          <pose>0 0 0.005 0 0 0</pose>
+          <geometry><cylinder><radius>0.7</radius><length>0.01</length></cylinder></geometry>
+          <material><ambient>0 0.8 0 1</ambient><diffuse>0 0.8 0 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="home_drone2">
+      <static>true</static>
+      <pose>0 -5 0 0 0 0</pose>
+      <link name="link">
+        <visual name="disc">
+          <pose>0 0 0.005 0 0 0</pose>
+          <geometry><cylinder><radius>0.7</radius><length>0.01</length></cylinder></geometry>
+          <material><ambient>0 0.8 0 1</ambient><diffuse>0 0.8 0 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="home_drone3">
+      <static>true</static>
+      <pose>0 5 0 0 0 0</pose>
+      <link name="link">
+        <visual name="disc">
+          <pose>0 0 0.005 0 0 0</pose>
+          <geometry><cylinder><radius>0.7</radius><length>0.01</length></cylinder></geometry>
+          <material><ambient>0 0.8 0 1</ambient><diffuse>0 0.8 0 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
 
     <!-- Renk İniş Zonları: RED ve BLUE -->
     <include>

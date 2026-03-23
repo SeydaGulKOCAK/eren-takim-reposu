@@ -84,12 +84,12 @@ CTRL_HZ: float = 10.0
 CTRL_DT: float = 1.0 / CTRL_HZ
 
 # Waypoint yaklaşma mesafeleri
-LOITER_RADIUS_M: float  = 5.0   # Bu mesafede loiter başlar (QR okuma)
+LOITER_RADIUS_M: float  = 3.0   # Bu mesafede loiter başlar (QR okuma)
 APPROACH_RADIUS_M: float = 20.0  # Bu mesafede "yaklaşma" moduna gir (log/debug)
 HOME_LOITER_M: float    = 3.0   # Eve bu kadar yakınken hover et
 
 # Varsayılan loiter süresi (QRResult.wait_seconds gelmezse)
-DEFAULT_LOITER_S: float = 3.0
+DEFAULT_LOITER_S: float = 120.0  # QR okunana kadar bekle (QRResult gelince override edilir)
 
 # QR trigger cooldown: bir QR'ı tekrar tetikleme süresi
 QR_TRIGGER_COOLDOWN_S: float = 10.0
@@ -157,14 +157,15 @@ class WaypointNavigatorNode(Node):
     """
 
     def __init__(self):
-        self.ns: str       = os.environ.get('DRONE_NS', 'drone1')
-        self.drone_id: int = int(os.environ.get('DRONE_ID', '1'))
-        self.swarm_size    = SWARM_SIZE
+        super().__init__('waypoint_navigator')
 
-        super().__init__(
-            f'waypoint_navigator_{self.drone_id}',
-            namespace=self.ns,
-        )
+        # ROS parametre öncelikli; env var fallback (eski çalıştırma uyumluluğu için)
+        self.declare_parameter('drone_id',   int(os.environ.get('DRONE_ID', '1')))
+        self.declare_parameter('num_drones', int(os.environ.get('SWARM_SIZE', '3')))
+
+        self.drone_id: int = self.get_parameter('drone_id').value
+        self.swarm_size    = self.get_parameter('num_drones').value
+        self.ns: str       = f'drone{self.drone_id}'
 
         self.get_logger().info(
             f'WaypointNavigator başladı — ns={self.ns}, id={self.drone_id}'
@@ -245,7 +246,7 @@ class WaypointNavigatorNode(Node):
                 LocalState,
                 f'/drone{i}/local_state',
                 lambda msg, uid=i: self._on_neighbor_state(msg, uid),
-                reliable_qos,
+                best_effort_qos,
             )
 
         # ── Yayıncılar ────────────────────────────────────────────────────────
@@ -308,14 +309,18 @@ class WaypointNavigatorNode(Node):
 
     def _on_qr_result(self, msg: QRResult) -> None:
         """
-        QR okundu — bekleme süresini güncelle.
-        LOITERING fazındaki bekleme süresini QR'dan gelen değere çek.
+        QR okundu — bekleme süresini QR'dan gelen değere ayarla ve
+        loiter başlangıcını şimdiye çek (böylece wait_seconds sonra devam eder).
         """
-        if msg.wait_seconds > 0:
-            self._loiter_duration_s = float(msg.wait_seconds)
-            self.get_logger().info(
-                f'QR#{msg.qr_id} bekleme süresi: {msg.wait_seconds:.1f}s'
-            )
+        wait = float(msg.wait_seconds) if msg.wait_seconds > 0 else 3.0
+        self._loiter_duration_s = wait
+        # Loiter başlangıcını şimdiye çek — wait_seconds sonra devam edecek
+        self._loiter_start_time = time.time()
+        self._nav_phase = NavPhase.WAITING
+        self.get_logger().info(
+            f'✅ QR#{msg.qr_id} KAMERADAN OKUNDU! '
+            f'Bekleme: {wait:.1f}s sonra devam edecek'
+        )
 
     def _on_own_pose(self, msg: PoseStamped) -> None:
         p = msg.pose.position
@@ -351,7 +356,7 @@ class WaypointNavigatorNode(Node):
                 continue
             # Durum filtresi
             state = self._neighbor_states.get(uid, '')
-            if state not in ('FLYING', 'DETACH', 'REJOIN', 'LAND_ZONE',
+            if state not in ('TAKING_OFF', 'FLYING', 'DETACH', 'REJOIN', 'LAND_ZONE',
                              'RETURN_HOME'):
                 continue
             xs.append(pose[0])
@@ -420,8 +425,7 @@ class WaypointNavigatorNode(Node):
         # ── Centroid hesabı ───────────────────────────────────────────────────
         centroid = self._get_flying_centroid()
         if centroid is None:
-            # Konum verisi yok → loiter güvenli
-            self._publish_loiter(True)
+            # Konum verisi yok → bekle (loiter tetikleme, drone'lar henüz uçmuyor olabilir)
             return
 
         # ── Mesafe hesabı (XY düzlemi) ────────────────────────────────────────

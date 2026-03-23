@@ -87,6 +87,7 @@ from swarm_msgs.msg import LocalState, SwarmIntent, JoinRequest, SafetyEvent, Co
 class State:
     STANDBY         = 'STANDBY'
     IDLE            = 'IDLE'
+    TAKING_OFF      = 'TAKING_OFF'
     FLYING          = 'FLYING'
     DETACH          = 'DETACH'
     LAND_ZONE       = 'LAND_ZONE'
@@ -181,7 +182,7 @@ class LocalFSM(Node):
 
         # ── KALKIŞ YÜKSEKLIĞI ─────────────────────────────────
         # İlk kalkışta ve REJOIN'da hedef irtifa
-        self._target_altitude: float = 5.0   # metre (intent'ten güncellenir)
+        self._target_altitude: float = 10.0   # metre (intent'ten güncellenir)
 
         # ── DETACH / LAND_ZONE TAKİBİ ─────────────────────────
         # Detach intent'ten gelen hedef iniş zone rengi ve pozisyonu
@@ -297,6 +298,7 @@ class LocalFSM(Node):
 
         # DETACH → LAND_ZONE ve LAND_ZONE → DISARM_WAIT otomatik geçiş (10 Hz)
         self.create_timer(0.1, self._check_landing_transitions)
+        self.create_timer(0.1, self._check_takeoff_complete)
 
         self.get_logger().info(
             f'✅ [{self.ns}] local_fsm HAZIR! İlk durum: {self._state}'
@@ -493,12 +495,24 @@ class LocalFSM(Node):
           FLYING  → FLYING : Devam ediyor (zaten uçuyor)
           REJOIN  → FLYING : Sürüye katıldıktan sonra
         """
-        if self._state == State.IDLE:
+        if self._state == State.STANDBY:
+            # STANDBY → TAKING_OFF: GUIDED + ARM + kalkış
+            self.get_logger().info(
+                f'🛫 [{self.ns}] KALKIŞ! STANDBY → TAKING_OFF, irtifa: {msg.drone_altitude:.1f}m'
+            )
+            self._transition_to(State.TAKING_OFF)
+            self._send_mode('GUIDED')
+            self._send_arm(True)
+
+        elif self._state == State.IDLE:
             self.get_logger().info(
                 f'🛫 [{self.ns}] KALKIŞ! Hedef irtifa: {msg.drone_altitude:.1f}m'
             )
-            self._transition_to(State.FLYING)
+            self._transition_to(State.TAKING_OFF)
             self._send_mode('GUIDED')
+
+        elif self._state == State.TAKING_OFF:
+            pass  # Kalkış devam ediyor, irtifa kontrolü _check_takeoff_complete'de
 
         elif self._state == State.REJOIN:
             # Sürüye yeniden katıldık, artık FLYING sayılıyoruz
@@ -589,8 +603,7 @@ class LocalFSM(Node):
                 f'FLYING → RETURN_HOME'
             )
             self._transition_to(State.RETURN_HOME)
-            self._send_mode('GUIDED')
-            # formation_controller home koordinatını setpoint olarak verecek
+            self._send_mode('RTL')  # ArduPilot otomatik eve döner ve iner
 
         elif self._state == State.RETURN_HOME:
             # Home'a geldik → LANDING'e geç
@@ -618,6 +631,53 @@ class LocalFSM(Node):
             if zone.color.upper() == self._target_zone_color.upper():
                 self._target_zone_pos = (zone.position.x, zone.position.y, zone.position.z)
                 return
+
+    def _check_takeoff_complete(self):
+        """
+        10 Hz — TAKING_OFF state'inde irtifa kontrolü.
+        Drone hedef irtifanın %50'sine ulaşınca hazır sinyali yayınlar.
+        Tüm drone'lar hazır olunca hepsi aynı anda FLYING'e geçer.
+        """
+        if self._state != State.TAKING_OFF:
+            return
+        if self._own_pos is None:
+            return
+        current_alt = self._own_pos[2]
+        threshold = self._target_altitude * 0.50
+        if current_alt >= threshold and not getattr(self, '_altitude_ready', False):
+            self._altitude_ready = True
+            self.get_logger().info(
+                f'✅ [{self.ns}] İrtifa hazır: {current_alt:.1f}m >= {threshold:.1f}m — FLYING sinyali yayınlanıyor'
+            )
+            # Hazır sinyali yayınla — tüm drone'lar hazır olunca hepsi aynı anda FLYING
+            latched_qos = QoSProfile(
+                reliability=QoSReliabilityPolicy.RELIABLE,
+                durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+                history=QoSHistoryPolicy.KEEP_LAST,
+                depth=1,
+            )
+            if not hasattr(self, '_sync_flying_pub'):
+                self._sync_flying_pub = self.create_publisher(Bool, '/swarm/sync_flying', 10)
+                self._sync_flying_ready = {}
+                _num = int(__import__('os').environ.get('SWARM_SIZE', '3'))
+                self._sync_flying_num = _num
+                for i in range(1, _num + 1):
+                    self.create_subscription(Bool, f'/swarm/drone{i}_flying_ready',
+                        lambda msg, uid=i: self._on_flying_ready(uid), latched_qos)
+            msg = Bool()
+            msg.data = True
+            ready_pub = self.create_publisher(Bool, f'/swarm/drone{self.drone_id}_flying_ready', latched_qos)
+            self.create_timer(0.05, lambda: ready_pub.publish(msg))
+
+    def _on_flying_ready(self, uid: int):
+        if not hasattr(self, '_sync_flying_ready'):
+            return
+        self._sync_flying_ready[uid] = True
+        if len(self._sync_flying_ready) >= self._sync_flying_num and self._state == State.TAKING_OFF:
+            self.get_logger().info(
+                f'🚀 [{self.ns}] Tüm drone\'lar irtifada ({len(self._sync_flying_ready)}/{self._sync_flying_num}) — SENKRON FLYING!'
+            )
+            self._transition_to(State.FLYING)
 
     def _check_landing_transitions(self):
         """

@@ -87,20 +87,20 @@ qr_nodes:
       gorev:
         formasyon:
           aktif: true
-          tip: "CIZGI"
+          tip: "OKBASI"
         manevra_pitch_roll:
           aktif: false
           pitch_deg: "0"
           roll_deg: "0"
         irtifa_degisim:
-          aktif: false
-          deger: 20
-        bekleme_suresi_s: 4
+          aktif: true
+          deger: 15
+        bekleme_suresi_s: 3
       suruden_ayrilma:
-        aktif: true
-        ayrilacak_drone_id: 2
-        hedef_renk: "RED"
-        bekleme_suresi_s: 10
+        aktif: false
+        ayrilacak_drone_id: null
+        hedef_renk: null
+        bekleme_suresi_s: null
       sonraki_qr:
         team_1: 4
         team_2: 4
@@ -117,15 +117,15 @@ qr_nodes:
       gorev:
         formasyon:
           aktif: true
-          tip: "OKBASI"
+          tip: "CIZGI"
         manevra_pitch_roll:
           aktif: false
           pitch_deg: "0"
           roll_deg: "0"
         irtifa_degisim:
-          aktif: true
-          deger: 15
-        bekleme_suresi_s: 3
+          aktif: false
+          deger: 20
+        bekleme_suresi_s: 4
       suruden_ayrilma:
         aktif: false
         ayrilacak_drone_id: null
@@ -149,8 +149,8 @@ qr_nodes:
           aktif: true
           tip: "V"
         manevra_pitch_roll:
-          aktif: true
-          pitch_deg: "10"
+          aktif: false
+          pitch_deg: "0"
           roll_deg: "0"
         irtifa_degisim:
           aktif: false

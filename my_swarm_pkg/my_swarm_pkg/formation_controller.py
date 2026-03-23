@@ -101,7 +101,7 @@ from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 
 from geometry_msgs.msg import PoseStamped, Quaternion
 from std_msgs.msg import String
-from swarm_msgs.msg import LocalState, SwarmIntent, FormationCmd, SafetyEvent, TeleopCmd
+from swarm_msgs.msg import LocalState, SwarmIntent, FormationCmd, SafetyEvent, TeleopCmd, QRResult
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DURUM SABİTLERİ
@@ -254,6 +254,13 @@ class FormationController(Node):
         # [v3] Sanal Lider (Virtual Structure) — navigasyon
         self._virtual_centroid_xyz: tuple[float, float, float] | None = None
 
+        # [BAŞLANGIÇ FORMASYON] Kalkış anındaki fiziksel düzen korunur
+        # Jüri dronları rastgele dizebilir → FORMATION_OFFSETS yerine gerçek ofset kullanılır.
+        # QR okunduğunda _initial_formation_active = False → FORMATION_OFFSETS'e geç
+        self._initial_formation_active: bool  = True
+        self._own_init_fwd:   float | None    = None   # Kalkış anındaki fwd ofseti (metre)
+        self._own_init_left:  float | None    = None   # Kalkış anındaki left ofseti (metre)
+
         # [waypoint_navigator] Loiter komutu: True iken setpoint dondurulur
         self._loiter_active: bool = False
 
@@ -342,6 +349,9 @@ class FormationController(Node):
             _Bool, '/swarm/loiter_cmd', self._on_loiter_cmd, 10
         )
 
+        # 10) [BAŞLANGIÇ FORMASYON] QR okunduğunda fiziksel ofsetten FORMATION_OFFSETS'e geç
+        self.create_subscription(QRResult, '/qr/result', self._on_qr_result_fc, 10)
+
         # ══════════════════════════════════════════════════════
         # PERİYODİK GÖREV
         # ══════════════════════════════════════════════════════
@@ -373,6 +383,15 @@ class FormationController(Node):
                 f'[{self.ns}] Loiter: {"AKTİF — setpoint donduruldu" if self._loiter_active else "PASIF — devam"}'
             )
 
+    def _on_qr_result_fc(self, msg: QRResult):
+        """QR okunduğunda başlangıç fiziksel ofsetinden FORMATION_OFFSETS'e geç."""
+        if self._initial_formation_active:
+            self._initial_formation_active = False
+            self.get_logger().info(
+                f'[{self.ns}] 📷 QR-{msg.qr_id} okundu → '
+                f'başlangıç fiziksel ofseti devre dışı, FORMATION_OFFSETS aktif'
+            )
+
     def _on_formation_cmd(self, msg: FormationCmd):
         self._latest_fcmd = msg
 
@@ -384,6 +403,9 @@ class FormationController(Node):
                 and old_state not in DroneState.ACTIVE_STATES
                 and msg.state in DroneState.ACTIVE_STATES):
             self._virtual_centroid_xyz = None
+            self._initial_formation_active = True
+            self._own_init_fwd  = None
+            self._own_init_left = None
             self.get_logger().info(f'[{self.ns}] 🔄 Sanal lider sıfırlandı (FLYING geçişi)')
 
     def _on_drone_pose(self, msg: PoseStamped, source_id: int):
@@ -579,10 +601,17 @@ class FormationController(Node):
         clamp_n      = max(clamp_n, 1)
         safe_rank    = min(rank_to_use, clamp_n - 1)
 
-        fwd_norm, left_norm = FORMATION_OFFSETS[formation][clamp_n][safe_rank]
-        s    = max(spacing, 1.0)
-        fwd  = fwd_norm  * s
-        left = left_norm * s
+        if (self._initial_formation_active
+                and self._own_init_fwd is not None
+                and self._teleop_mode not in ('MOVE', 'MANEUVER')):
+            # Kalkış anındaki fiziksel pozisyon korunur — jüri düzeni
+            fwd  = self._own_init_fwd
+            left = self._own_init_left  # type: ignore[assignment]
+        else:
+            fwd_norm, left_norm = FORMATION_OFFSETS[formation][clamp_n][safe_rank]
+            s    = max(spacing, 1.0)
+            fwd  = fwd_norm  * s
+            left = left_norm * s
 
         cos_y = math.cos(yaw)
         sin_y = math.sin(yaw)
@@ -730,6 +759,31 @@ class FormationController(Node):
                 f'({phys[0]:.1f}, {phys[1]:.1f}, {phys[2]:.1f}) → '
                 f'hedef ({target_x:.1f}, {target_y:.1f}, {target_z:.1f})'
             )
+
+            # ── BAŞLANGIÇ FİZİKSEL OFSETİ hesapla ───────────────────────
+            # Drone kalkış anında hangi konumdaysa o ofseti korur.
+            # Yaw: centroid → hedef yönü (kalkış anındaki uçuş yönü)
+            init_yaw = math.atan2(target_y - phys[1], target_x - phys[0])
+            own_pose = self._drone_poses.get(self.drone_id)
+            if own_pose is not None:
+                ox = own_pose.pose.position.x - phys[0]
+                oy = own_pose.pose.position.y - phys[1]
+                cos_y = math.cos(init_yaw)
+                sin_y = math.sin(init_yaw)
+                self._own_init_fwd  =  ox * cos_y + oy * sin_y
+                self._own_init_left = -ox * sin_y + oy * cos_y
+                self.get_logger().info(
+                    f'[{self.ns}] 📍 Kalkış ofseti: '
+                    f'fwd={self._own_init_fwd:.2f}m  left={self._own_init_left:.2f}m  '
+                    f'(yaw={math.degrees(init_yaw):.1f}°)'
+                )
+            else:
+                # Pose henüz gelmediyse: centroid'de kal (sıfır ofset)
+                self._own_init_fwd  = 0.0
+                self._own_init_left = 0.0
+                self.get_logger().warn(
+                    f'[{self.ns}] ⚠️  Kalkış ofseti: pose yok → sıfır ofset'
+                )
 
         # ── Lider değilse: paylaşılan VL'i kullan (senkronizasyon) ──────
         is_leader = (
