@@ -906,9 +906,9 @@ class IntentCoordinator(Node):
 
     # ── FORMATION OFFSET TABLES (lider kompanzasyonu için) ─────────
     _FORMATION_OFFSETS = {
-        'OKBASI': {3: (2/3, 0.0), 2: (0.5, 0.0), 1: (0.0, 0.0)},
-        'V':      {3: (2/3, 0.0), 2: (0.5, 0.0), 1: (0.0, 0.0)},
-        'CIZGI':  {3: (0.0, 1.0), 2: (0.0, 0.5), 1: (0.0, 0.0)},
+        'OKBASI': {3: ( 2/3, 0.0), 2: ( 0.5, 0.0), 1: (0.0, 0.0)},
+        'V':      {3: (-2/3, 0.0), 2: (-0.5, 0.0), 1: (0.0, 0.0)},
+        'CIZGI':  {3: ( 0.0, 1.0), 2: ( 0.0, 0.5), 1: (0.0, 0.0)},
     }
 
     def _compensate_leader_offset(self, qr_pos: Point) -> Point:

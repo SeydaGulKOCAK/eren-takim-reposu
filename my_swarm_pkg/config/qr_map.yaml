@@ -87,7 +87,7 @@ qr_nodes:
       gorev:
         formasyon:
           aktif: true
-          tip: "OKBASI"
+          tip: "CIZGI"
         manevra_pitch_roll:
           aktif: false
           pitch_deg: "0"
@@ -117,7 +117,7 @@ qr_nodes:
       gorev:
         formasyon:
           aktif: true
-          tip: "CIZGI"
+          tip: "OKBASI"
         manevra_pitch_roll:
           aktif: false
           pitch_deg: "0"
